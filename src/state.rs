@@ -5,7 +5,10 @@ use embassy_sync::{
 };
 
 use crate::{
-    can::{cache::CanCache, command::TransactionTracker, protocol::CanTxMessage},
+    can::{
+        cache::CanCache, command::TransactionTracker, protocol::CanTxMessage,
+        recovery::RecoverySession,
+    },
     lora_uplink::UplinkCommand,
     payload::LoraFrame,
 };
@@ -75,6 +78,10 @@ pub struct RawCanRecord {
 pub static CAN_CACHE: Mutex<CriticalSectionRawMutex, CanCache> = Mutex::new(CanCache::new());
 pub static COMMAND_TRACKER: Mutex<CriticalSectionRawMutex, TransactionTracker> =
     Mutex::new(TransactionTracker::new());
+pub static RECOVERY_SESSION: Mutex<CriticalSectionRawMutex, RecoverySession> =
+    Mutex::new(RecoverySession::new());
+pub static RECOVERY_BEACON_ACTIVE: AtomicBool = AtomicBool::new(false);
+pub static RECOVERY_ENTER_SENT: AtomicBool = AtomicBool::new(false);
 pub static GNSS_TELEMETRY: Mutex<CriticalSectionRawMutex, GnssTelemetry> =
     Mutex::new(GnssTelemetry::new());
 pub static GNSS_CHANNEL: Channel<CriticalSectionRawMutex, GnssPacket, 5> = Channel::new();

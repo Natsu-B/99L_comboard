@@ -23,7 +23,7 @@ use crate::{
     state::{
         CAN_CACHE, CAN_HEALTH, CAN_REC, CAN_RX_ERROR_COUNT, CAN_SAFETY_TX_SIGNAL, CAN_TEC,
         CAN_TX_CHANNEL, CAN_TX_ERROR_COUNT, COMMAND_TRACKER, IMMEDIATE_LORA_CHANNEL, IS_CAN_ERROR,
-        RAW_CAN_LOG_CHANNEL, RAW_CAN_LOG_DROPPED_COUNT, RawCanRecord,
+        RAW_CAN_LOG_CHANNEL, RAW_CAN_LOG_DROPPED_COUNT, RECOVERY_SESSION, RawCanRecord,
     },
 };
 
@@ -152,7 +152,18 @@ async fn apply_received_message(message: CanRxMessage, received_at_ms: u64) {
             );
         }
         CacheUpdate::DuplicateMissionEvent => {}
-        CacheUpdate::RecoveryStatus(status) => println!("RecoveryStatus: {:?}", status),
+        CacheUpdate::RecoveryStatus(status) => {
+            if let Some(result) = RECOVERY_SESSION.lock().await.apply_status(status) {
+                queue_application(ApplicationPacket::CommandResult(CommandResultPacket {
+                    transaction_id: result.transaction_id,
+                    command: result.command,
+                    phase: result.phase,
+                    reason: result.reason,
+                    detail: result.detail,
+                }))
+                .await;
+            }
+        }
         CacheUpdate::RecoveryLogData(_) | CacheUpdate::Telemetry => {}
     }
 }

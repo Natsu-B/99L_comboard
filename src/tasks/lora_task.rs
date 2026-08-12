@@ -16,19 +16,22 @@ use crate::{
         command::RegisterResult,
         protocol::{
             CanTxMessage, CommandPhase, CommandReason, GenericCommandRequest, MissionState,
+            RecoveryControl, RecoveryOpcode, RecoverySource,
         },
+        recovery::PendingRecovery,
     },
     constants::{LORA_AUX_TIMEOUT_MS, LORA_RX_TX_GUARD_MS, LORA_TRANSMIT_INTERVAL_MS},
     lora_uplink::{UplinkCommand, UplinkFrameBuffer},
     payload::{
         ApplicationPacket, CommandReceiveTelemetry, CommandResultPacket, DescentTelemetry,
-        FlightTelemetry, LoraFrame, PacketHeader,
+        FlightTelemetry, LoraFrame, PacketHeader, RecoveryBeacon,
     },
     state::{
         CAN_CACHE, CAN_SAFETY_TX_SIGNAL, CAN_TX_CHANNEL, COMMAND_TRACKER, CanTxRequest,
         GNSS_CMD_CHANNEL, GNSS_TELEMETRY, GnssCommand, IMMEDIATE_LORA_CHANNEL, IS_CAN_ERROR,
         LOGGING_REQUESTED, LORA_AUX_TIMEOUT_COUNT, LORA_COMMAND_DROP_COUNT, LORA_RX_ERROR_COUNT,
-        LORA_TX_ERROR_COUNT, SD_FLUSH_SIGNAL, SD_HAS_ERROR, UPLINK_COMMAND_CHANNEL,
+        LORA_TX_ERROR_COUNT, RECOVERY_BEACON_ACTIVE, RECOVERY_ENTER_SENT, RECOVERY_SESSION,
+        SD_FLUSH_SIGNAL, SD_HAS_ERROR, UPLINK_COMMAND_CHANNEL,
     },
 };
 
@@ -37,19 +40,29 @@ static LORA_RX_ACTIVITY_SIGNAL: Signal<CriticalSectionRawMutex, Instant> = Signa
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 #[repr(u8)]
 enum LocalCommand {
-    StartLogging = 1,
-    StopLogging = 2,
-    GnssOn = 3,
-    GnssOff = 4,
+    StartLogging = b'l',
+    StopLogging = b'm',
+    GnssOn = b'g',
+    GnssOff = b'h',
+    EnterRecovery = b'r',
+    Wake = b'w',
+    DumpInternalFlash = b'f',
+    DumpMissionSd = b's',
+    StopDump = b'x',
 }
 
 impl LocalCommand {
     const fn decode(raw: u8) -> Option<Self> {
         match raw {
-            1 => Some(Self::StartLogging),
-            2 => Some(Self::StopLogging),
-            3 => Some(Self::GnssOn),
-            4 => Some(Self::GnssOff),
+            b'l' => Some(Self::StartLogging),
+            b'm' => Some(Self::StopLogging),
+            b'g' => Some(Self::GnssOn),
+            b'h' => Some(Self::GnssOff),
+            b'r' => Some(Self::EnterRecovery),
+            b'w' => Some(Self::Wake),
+            b'f' => Some(Self::DumpInternalFlash),
+            b's' => Some(Self::DumpMissionSd),
+            b'x' => Some(Self::StopDump),
             _ => None,
         }
     }
@@ -168,6 +181,39 @@ async fn periodic_packet() -> Option<LoraFrame> {
     let lps = stale_or(cache.lps, now_ms, FRESHNESS_25_HZ_MS);
     let airspeed = stale_or(cache.airspeed, now_ms, FRESHNESS_100_HZ_MS);
     let power = stale_or(cache.power_time, now_ms, FRESHNESS_10_HZ_MS);
+
+    if !RECOVERY_BEACON_ACTIVE.load(Ordering::Relaxed)
+        && state == MissionState::Descent
+        && power
+            .is_some_and(|value| value.descent_elapsed < 0xfff0 && value.descent_elapsed >= 1_200)
+    {
+        RECOVERY_BEACON_ACTIVE.store(true, Ordering::Relaxed);
+    }
+    if RECOVERY_BEACON_ACTIVE.load(Ordering::Relaxed) {
+        if !RECOVERY_ENTER_SENT.swap(true, Ordering::Relaxed) {
+            CAN_TX_CHANNEL
+                .send(CanTxRequest {
+                    message: CanTxMessage::RecoveryControl(RecoveryControl {
+                        opcode: RecoveryOpcode::EnterRecovery,
+                        source: RecoverySource::InternalFlash,
+                        transfer_id: 0xff,
+                        offset: 0,
+                        length: 0,
+                    }),
+                })
+                .await;
+        }
+        return ApplicationPacket::RecoveryBeacon(RecoveryBeacon {
+            logic_voltage: power.map_or(253, |value| value.logic_voltage),
+            motor_voltage: power.map_or(253, |value| value.motor_voltage),
+            east: gnss.east,
+            north: gnss.north,
+            height: gnss.height,
+            elapsed: power.map_or(0xfffa, |value| value.recovery_elapsed),
+        })
+        .encode()
+        .ok();
+    }
 
     let packet = match state {
         MissionState::CommandReceive | MissionState::Unknown => {
@@ -314,7 +360,11 @@ async fn process_local(transaction_id: u8, command: u8, args: [u8; 6]) {
         .await;
         return;
     };
-    if args.iter().any(|value| *value != 0) {
+    let recovery_dump = matches!(
+        command_value,
+        LocalCommand::DumpInternalFlash | LocalCommand::DumpMissionSd
+    );
+    if !recovery_dump && args.iter().any(|value| *value != 0) {
         queue_result(
             transaction_id,
             command,
@@ -332,6 +382,67 @@ async fn process_local(transaction_id: u8, command: u8, args: [u8; 6]) {
         }
         LocalCommand::GnssOn => GNSS_CMD_CHANNEL.send(GnssCommand::TurnOn).await,
         LocalCommand::GnssOff => GNSS_CMD_CHANNEL.send(GnssCommand::TurnOff).await,
+        LocalCommand::EnterRecovery
+        | LocalCommand::Wake
+        | LocalCommand::DumpInternalFlash
+        | LocalCommand::DumpMissionSd
+        | LocalCommand::StopDump => {
+            let opcode = match command_value {
+                LocalCommand::EnterRecovery => RecoveryOpcode::EnterRecovery,
+                LocalCommand::Wake => RecoveryOpcode::Wake,
+                LocalCommand::DumpInternalFlash | LocalCommand::DumpMissionSd => {
+                    RecoveryOpcode::StartLogDump
+                }
+                LocalCommand::StopDump => RecoveryOpcode::StopLogDump,
+                _ => unreachable!(),
+            };
+            let source = if command_value == LocalCommand::DumpMissionSd {
+                RecoverySource::MissionSdLatestFlight
+            } else {
+                RecoverySource::InternalFlash
+            };
+            let offset = u32::from_le_bytes([args[0], args[1], args[2], 0]);
+            let length = u32::from_le_bytes([args[3], args[4], args[5], 0]);
+            let pending = PendingRecovery {
+                transaction_id,
+                command,
+                opcode,
+                source,
+            };
+            if !RECOVERY_SESSION.lock().await.start(pending) {
+                queue_result(
+                    transaction_id,
+                    command,
+                    CommandPhase::Rejected,
+                    CommandReason::Busy,
+                )
+                .await;
+                return;
+            }
+            if command_value == LocalCommand::EnterRecovery {
+                RECOVERY_BEACON_ACTIVE.store(true, Ordering::Relaxed);
+                RECOVERY_ENTER_SENT.store(true, Ordering::Relaxed);
+            }
+            CAN_TX_CHANNEL
+                .send(CanTxRequest {
+                    message: CanTxMessage::RecoveryControl(RecoveryControl {
+                        opcode,
+                        source,
+                        transfer_id: transaction_id,
+                        offset,
+                        length,
+                    }),
+                })
+                .await;
+            queue_result(
+                transaction_id,
+                command,
+                CommandPhase::Accepted,
+                CommandReason::None,
+            )
+            .await;
+            return;
+        }
     }
     queue_result(
         transaction_id,
