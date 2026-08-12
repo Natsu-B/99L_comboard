@@ -11,24 +11,19 @@ use esp_println::println;
 
 use crate::{
     can::{
-        command::{
-            CommandFailure, CommandFailureRecord, CommandRequestState, queued_request_is_current,
-        },
+        cache::{CacheUpdate, FRESHNESS_10_HZ_MS},
         health::{CanHealth, classify_can_health},
-        protocol::{CanRxMessage, ControllerLinkState, ControllerStatus},
+        protocol::CanRxMessage,
         tx::{CanTxError, transmit_message_with_timeout},
     },
     constants::{
         CAN_CONSECUTIVE_ERROR_THRESHOLD, CAN_HEALTH_MONITOR_INTERVAL_MS, CAN_TX_TIMEOUT_MS,
-        COMMAND_CONFIRM_TIMEOUT_MS,
     },
+    payload::{ApplicationPacket, CommandResultPacket},
     state::{
-        CAN_HEALTH, CAN_REC, CAN_RX_ERROR_COUNT, CAN_SAFETY_TX_SIGNAL, CAN_TEC, CAN_TX_CHANNEL,
-        CAN_TX_ERROR_COUNT, COMMAND_REQUEST_FAILURE_COUNT, COMMAND_REQUEST_STATE,
-        CONTROLLER_STATUS_RAW, CONTROLLER_STATUS_RX_COUNT, CONTROLLER_STATUS_STATE,
-        FIN_ANGLE_DROPPED_COUNT, HAS_VALID_CONTROLLER_STATUS, IS_CAN_ERROR, LAST_COMMAND_FAILURE,
-        LATEST_LOGGING_GENERATION, LATEST_PARA_POSITION_GENERATION, LATEST_SEQUENCE_GENERATION,
-        LEGACY_LIFTOFF_TOP_RX_COUNT, PAYLOAD_MUTEX,
+        CAN_CACHE, CAN_HEALTH, CAN_REC, CAN_RX_ERROR_COUNT, CAN_SAFETY_TX_SIGNAL, CAN_TEC,
+        CAN_TX_CHANNEL, CAN_TX_ERROR_COUNT, COMMAND_TRACKER, IMMEDIATE_LORA_CHANNEL, IS_CAN_ERROR,
+        RAW_CAN_LOG_CHANNEL, RAW_CAN_LOG_DROPPED_COUNT, RawCanRecord,
     },
 };
 
@@ -57,18 +52,13 @@ const fn transition_runtime(
             CanRuntimeState::AwaitingTraffic,
             CanRuntimeEvent::TransmitSucceeded | CanRuntimeEvent::ReceiveSucceeded,
         ) => (CanRuntimeState::Normal, false),
-        (CanRuntimeState::AwaitingTraffic, CanRuntimeEvent::BusOff) => {
+        (CanRuntimeState::AwaitingTraffic | CanRuntimeState::Normal, CanRuntimeEvent::BusOff) => {
             (CanRuntimeState::BusRecovering, true)
         }
-        (CanRuntimeState::AwaitingTraffic, CanRuntimeEvent::TimedOutUnknownState) => {
-            (CanRuntimeState::TxStateUnknown, true)
-        }
-        (CanRuntimeState::Normal, CanRuntimeEvent::BusOff) => {
-            (CanRuntimeState::BusRecovering, true)
-        }
-        (CanRuntimeState::Normal, CanRuntimeEvent::TimedOutUnknownState) => {
-            (CanRuntimeState::TxStateUnknown, true)
-        }
+        (
+            CanRuntimeState::AwaitingTraffic | CanRuntimeState::Normal,
+            CanRuntimeEvent::TimedOutUnknownState,
+        ) => (CanRuntimeState::TxStateUnknown, true),
         (CanRuntimeState::TxStateUnknown, CanRuntimeEvent::BusOff) => {
             (CanRuntimeState::BusRecovering, false)
         }
@@ -78,8 +68,8 @@ const fn transition_runtime(
         (
             CanRuntimeState::BusRecovering | CanRuntimeState::TxStateUnknown,
             CanRuntimeEvent::TransmitSucceeded,
-        ) => (CanRuntimeState::Normal, false),
-        (CanRuntimeState::BusRecovering, CanRuntimeEvent::ReceiveSucceeded) => {
+        )
+        | (CanRuntimeState::BusRecovering, CanRuntimeEvent::ReceiveSucceeded) => {
             (CanRuntimeState::Normal, false)
         }
         (state, _) => (state, false),
@@ -97,7 +87,6 @@ fn enter_recovering(
     } else {
         can
     };
-
     (can, next_state, restart_required)
 }
 
@@ -105,11 +94,9 @@ fn publish_health(can: &twai::Twai<'static, Async>) -> CanHealth {
     let tec = can.transmit_error_count();
     let rec = can.receive_error_count();
     let health = classify_can_health(tec, rec, can.is_bus_off());
-
     CAN_TEC.store(tec, Ordering::Relaxed);
     CAN_REC.store(rec, Ordering::Relaxed);
     CAN_HEALTH.store(health as u8, Ordering::Relaxed);
-
     health
 }
 
@@ -128,120 +115,76 @@ fn publish_error_state(
     );
 }
 
-async fn apply_received_message(message: CanRxMessage) {
-    match message {
-        CanRxMessage::LiftOff { .. } | CanRxMessage::Top { .. } => {
-            LEGACY_LIFTOFF_TOP_RX_COUNT.fetch_add(1, Ordering::Relaxed);
+async fn queue_application(packet: ApplicationPacket) {
+    match packet.encode() {
+        Ok(frame) => {
+            if IMMEDIATE_LORA_CHANNEL.try_send(frame).is_err() {
+                println!("即時LoRa packet queue overflow");
+            }
         }
-        CanRxMessage::AngleSpeed { xyz } => {
-            PAYLOAD_MUTEX.lock().await.angle_speed = xyz;
-        }
-        CanRxMessage::Acceleration { xyz } => {
-            PAYLOAD_MUTEX.lock().await.acceleration = xyz;
-        }
-        CanRxMessage::AirPressure { bytes } => {
-            PAYLOAD_MUTEX.lock().await.air_pressure = bytes;
-        }
-        CanRxMessage::AccumulatedAngle { xyz } => {
-            PAYLOAD_MUTEX.lock().await.integrated_angle = xyz;
-        }
-        // The protocol contains three i16 fin values, while Payload has one i8
-        // field. Do not guess which value or narrowing rule should be used.
-        CanRxMessage::FinAngle { .. } => {
-            FIN_ANGLE_DROPPED_COUNT.fetch_add(1, Ordering::Relaxed);
-        }
-        CanRxMessage::ControllerStatus { status } => {
-            apply_controller_status(status).await;
-        } // Command frames are transmitted by this board and have no RX side effect.
+        Err(error) => println!("LoRa packet encode error: {:?}", error),
     }
 }
 
-async fn apply_controller_status(status: ControllerStatus) {
-    {
-        let mut controller = CONTROLLER_STATUS_STATE.lock().await;
-        controller.status = Some(status);
-        controller.last_seen = Some(Instant::now());
-        controller.link = ControllerLinkState::Online;
-    }
-    CONTROLLER_STATUS_RX_COUNT.fetch_add(1, Ordering::Relaxed);
-
-    CONTROLLER_STATUS_RAW.store(status.raw(), Ordering::Relaxed);
-    HAS_VALID_CONTROLLER_STATUS.store(true, Ordering::Relaxed);
-    PAYLOAD_MUTEX.lock().await.status = status.raw();
-
-    let mut request_state = COMMAND_REQUEST_STATE.lock().await;
-    let previous_request = *request_state;
-    *request_state = request_state.confirm(status.sequence_active(), status.liftoff_detected());
-    if previous_request != *request_state
-        && let CommandRequestState::Completed { command, .. } = *request_state
-    {
-        println!("CAN command confirmed by controller: {:?}", command);
-    }
-    drop(request_state);
-}
-
-async fn mark_request_transmitted(token: u32) {
-    let mut state = COMMAND_REQUEST_STATE.lock().await;
-    *state = state.mark_transmitted(token, Instant::now().as_millis());
-}
-
-async fn mark_request_transmit_failed(token: u32) {
-    let failure = {
-        let mut state = COMMAND_REQUEST_STATE.lock().await;
-        let previous = *state;
-        *state = state.mark_transmit_failed(token);
-        (previous != *state).then(|| state.failure()).flatten()
-    };
-    if let Some(failure) = failure {
-        COMMAND_REQUEST_FAILURE_COUNT.fetch_add(1, Ordering::Relaxed);
-        *LAST_COMMAND_FAILURE.lock().await = Some(failure);
-    }
-}
-
-async fn expire_pending_request() {
-    let failure = {
-        let mut state = COMMAND_REQUEST_STATE.lock().await;
-        let previous = *state;
-        *state = state.expire(Instant::now().as_millis(), COMMAND_CONFIRM_TIMEOUT_MS);
-        (previous != *state).then(|| state.failure()).flatten()
-    };
-    if let Some(failure) = failure {
-        COMMAND_REQUEST_FAILURE_COUNT.fetch_add(1, Ordering::Relaxed);
-        *LAST_COMMAND_FAILURE.lock().await = Some(failure);
-        println!(
-            "CAN command confirmation unavailable: {:?} {:?}",
-            failure.command, failure.reason
-        );
+async fn apply_received_message(message: CanRxMessage, received_at_ms: u64) {
+    let update = CAN_CACHE.lock().await.update(message, received_at_ms);
+    match update {
+        CacheUpdate::CommandResult(result) => {
+            if !COMMAND_TRACKER.lock().await.apply_result(result) {
+                println!("pending requestに一致しないCommandResult");
+            }
+            queue_application(ApplicationPacket::CommandResult(CommandResultPacket {
+                transaction_id: result.transaction_id,
+                command: result.command,
+                phase: result.phase,
+                reason: result.reason,
+                detail: result.detail,
+            }))
+            .await;
+        }
+        CacheUpdate::TimeRequest { request_id } => {
+            queue_application(ApplicationPacket::GroundTimeRequest { request_id }).await;
+        }
+        CacheUpdate::MissionEvent { event, new_flags } => {
+            println!(
+                "MissionEvent seq={} flags=0x{:04x} new=0x{:04x}",
+                event.sequence, event.flags, new_flags
+            );
+        }
+        CacheUpdate::DuplicateMissionEvent => {}
+        CacheUpdate::RecoveryStatus(status) => println!("RecoveryStatus: {:?}", status),
+        CacheUpdate::RecoveryLogData(_) | CacheUpdate::Telemetry => {}
     }
 }
 
 async fn handle_received_frame(frame: EspTwaiFrame) {
-    let id = match frame.id() {
+    let identifier = match frame.id() {
         Id::Standard(id) => id.as_raw(),
         Id::Extended(id) => {
             CAN_RX_ERROR_COUNT.fetch_add(1, Ordering::Relaxed);
-            println!("unsupported extended CAN frame: id=0x{:08x}", id.as_raw());
+            println!("extended CAN frame rejected: id=0x{:08x}", id.as_raw());
             return;
         }
     };
+    let received_at_ms = Instant::now().as_millis();
+    let mut raw = RawCanRecord {
+        received_at_ms,
+        identifier,
+        data_length: frame.data().len() as u8,
+        data: [0; 8],
+    };
+    raw.data[..frame.data().len()].copy_from_slice(frame.data());
+    if RAW_CAN_LOG_CHANNEL.try_send(raw).is_err() {
+        RAW_CAN_LOG_DROPPED_COUNT.fetch_add(1, Ordering::Relaxed);
+    }
 
-    match CanRxMessage::decode_standard(id, frame.data()) {
-        Ok(message) => apply_received_message(message).await,
+    match CanRxMessage::decode_standard(identifier, frame.data()) {
+        Ok(message) => apply_received_message(message, received_at_ms).await,
         Err(error) => {
             CAN_RX_ERROR_COUNT.fetch_add(1, Ordering::Relaxed);
             println!("invalid CAN frame: {:?}", error);
         }
     }
-}
-
-fn request_is_current(request: &crate::state::CanTxRequest) -> bool {
-    queued_request_is_current(
-        request.command,
-        request.generation,
-        LATEST_SEQUENCE_GENERATION.load(Ordering::Relaxed),
-        LATEST_LOGGING_GENERATION.load(Ordering::Relaxed),
-        LATEST_PARA_POSITION_GENERATION.load(Ordering::Relaxed),
-    )
 }
 
 #[embassy_executor::task]
@@ -264,33 +207,16 @@ pub async fn can_communication_task(mut can: twai::Twai<'static, Async>) {
                 let request = match request {
                     Either::First(request) | Either::Second(request) => request,
                 };
-                if !request_is_current(&request) {
-                    *LAST_COMMAND_FAILURE.lock().await = Some(CommandFailureRecord {
-                        token: request.generation,
-                        command: request.command,
-                        reason: CommandFailure::Superseded,
-                    });
-                    COMMAND_REQUEST_FAILURE_COUNT.fetch_add(1, Ordering::Relaxed);
-                    println!("superseded queued CAN command: {:?}", request.command);
-                    continue;
-                }
                 match transmit_message_with_timeout(&mut can, request.message, tx_timeout).await {
                     Ok(()) => {
                         consecutive_tx_errors = 0;
-                        if let Some(token) = request.tracking_token {
-                            mark_request_transmitted(token).await;
-                        }
                         runtime_state =
                             transition_runtime(runtime_state, CanRuntimeEvent::TransmitSucceeded).0;
                     }
                     Err(error) => {
                         CAN_TX_ERROR_COUNT.fetch_add(1, Ordering::Relaxed);
                         consecutive_tx_errors = consecutive_tx_errors.saturating_add(1);
-                        if let Some(token) = request.tracking_token {
-                            mark_request_transmit_failed(token).await;
-                        }
                         println!("CAN transmit error: {:?}", error);
-
                         if matches!(error, CanTxError::BusOff | CanTxError::TimedOutUnknownState) {
                             let event = if error == CanTxError::BusOff {
                                 CanRuntimeEvent::BusOff
@@ -300,19 +226,9 @@ pub async fn can_communication_task(mut can: twai::Twai<'static, Async>) {
                             let recovery = enter_recovering(can, runtime_state, event);
                             can = recovery.0;
                             runtime_state = recovery.1;
-                            if recovery.2 {
-                                println!("TWAI restarted after transmit failure");
-                            }
                         }
                     }
                 }
-                let health = publish_health(&can);
-                publish_error_state(
-                    runtime_state,
-                    health,
-                    consecutive_tx_errors,
-                    consecutive_rx_errors,
-                );
             }
             Either3::Third(result) => match result {
                 Ok(frame) => {
@@ -320,55 +236,44 @@ pub async fn can_communication_task(mut can: twai::Twai<'static, Async>) {
                     runtime_state =
                         transition_runtime(runtime_state, CanRuntimeEvent::ReceiveSucceeded).0;
                     handle_received_frame(frame).await;
-                    let health = publish_health(&can);
-                    publish_error_state(
-                        runtime_state,
-                        health,
-                        consecutive_tx_errors,
-                        consecutive_rx_errors,
-                    );
                 }
                 Err(error) => {
                     CAN_RX_ERROR_COUNT.fetch_add(1, Ordering::Relaxed);
                     consecutive_rx_errors = consecutive_rx_errors.saturating_add(1);
                     println!("CAN receive error: {:?}", error);
-
                     if error == EspTwaiError::BusOff {
                         let recovery =
                             enter_recovering(can, runtime_state, CanRuntimeEvent::BusOff);
                         can = recovery.0;
                         runtime_state = recovery.1;
-                        if recovery.2 {
-                            println!("TWAI restarted after receive failure");
-                        }
                     }
-                    let health = publish_health(&can);
-                    publish_error_state(
-                        runtime_state,
-                        health,
-                        consecutive_tx_errors,
-                        consecutive_rx_errors,
-                    );
                 }
             },
             Either3::First(_) => {
-                expire_pending_request().await;
                 let health = publish_health(&can);
                 if health == CanHealth::BusOff {
                     let recovery = enter_recovering(can, runtime_state, CanRuntimeEvent::BusOff);
                     can = recovery.0;
                     runtime_state = recovery.1;
-                    if recovery.2 {
-                        println!("TWAI restarted after health monitor detected Bus Off");
-                    }
                 }
-                publish_error_state(
-                    runtime_state,
-                    health,
-                    consecutive_tx_errors,
-                    consecutive_rx_errors,
-                );
+                let now_ms = Instant::now().as_millis();
+                if CAN_CACHE
+                    .lock()
+                    .await
+                    .mission_status
+                    .freshness(now_ms, FRESHNESS_10_HZ_MS)
+                    != crate::can::cache::Freshness::Fresh
+                {
+                    IS_CAN_ERROR.store(true, Ordering::Relaxed);
+                }
             }
         }
+        let health = publish_health(&can);
+        publish_error_state(
+            runtime_state,
+            health,
+            consecutive_tx_errors,
+            consecutive_rx_errors,
+        );
     }
 }

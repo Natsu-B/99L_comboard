@@ -1,5 +1,6 @@
 pub mod nmea;
 pub mod settings;
+pub mod telemetry;
 
 pub use nmea::{
     FixQuality, GgaData, GgaParseError, GstData, NmeaParseError, RmcData, UtcTime, parse_gga,

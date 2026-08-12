@@ -12,90 +12,46 @@ use esp_println::println;
 
 use crate::{
     can::{
-        command::{
-            CommandCategory, CommandPriority, CommandRequestState, GroundCommand,
-            command_already_satisfied, may_supersede,
+        cache::{FRESHNESS_10_HZ_MS, FRESHNESS_25_HZ_MS, FRESHNESS_100_HZ_MS, Freshness},
+        command::RegisterResult,
+        protocol::{
+            CanTxMessage, CommandPhase, CommandReason, GenericCommandRequest, MissionState,
         },
-        protocol::CanTxMessage,
     },
     constants::{LORA_AUX_TIMEOUT_MS, LORA_RX_TX_GUARD_MS, LORA_TRANSMIT_INTERVAL_MS},
-    lora_uplink::UplinkFrameBuffer,
-    state::{
-        CAN_SAFETY_TX_SIGNAL, CAN_TX_CHANNEL, COMMAND_REQUEST_FAILURE_COUNT, COMMAND_REQUEST_STATE,
-        CONTROLLER_STATUS_RAW, CanTxRequest, GNSS_CMD_CHANNEL, GnssCommand,
-        HAS_VALID_CONTROLLER_STATUS, LAST_COMMAND_FAILURE, LATEST_LOGGING_GENERATION,
-        LATEST_PARA_POSITION_GENERATION, LATEST_SEQUENCE_GENERATION, LOGGING_REQUESTED,
-        LORA_AUX_TIMEOUT_COUNT, LORA_COMMAND_DROP_COUNT, LORA_RX_ERROR_COUNT, LORA_TX_ERROR_COUNT,
-        PAYLOAD_MUTEX, RECEIVED_DATA_CHANNEL, SD_FLUSH_SIGNAL,
+    lora_uplink::{UplinkCommand, UplinkFrameBuffer},
+    payload::{
+        ApplicationPacket, CommandReceiveTelemetry, CommandResultPacket, DescentTelemetry,
+        FlightTelemetry, LoraFrame, PacketHeader,
     },
-};
-
-#[cfg(feature = "lora-timing-debug")]
-use crate::lora_timing::{
-    AUX_DONE_INTERVAL, AUX_LOW_DELAY, AUX_LOW_DURATION, IDLE_GAP, INITIAL_AUX_WAIT,
-    PAYLOAD_PREPARE, POST_GUARD_AUX_WAIT, POST_UART_TO_DONE, PRE_AUX_WAIT, REQUEST_INTERVAL,
-    RX_GUARD_WAIT, RequestSource, TX_TOTAL, TimingCollector, TimingReport, TxTimingTrace,
-    UART_FLUSH, UART_WRITE, WRITE_START_INTERVAL,
+    state::{
+        CAN_CACHE, CAN_SAFETY_TX_SIGNAL, CAN_TX_CHANNEL, COMMAND_TRACKER, CanTxRequest,
+        GNSS_CMD_CHANNEL, GNSS_TELEMETRY, GnssCommand, IMMEDIATE_LORA_CHANNEL, IS_CAN_ERROR,
+        LOGGING_REQUESTED, LORA_AUX_TIMEOUT_COUNT, LORA_COMMAND_DROP_COUNT, LORA_RX_ERROR_COUNT,
+        LORA_TX_ERROR_COUNT, SD_FLUSH_SIGNAL, SD_HAS_ERROR, UPLINK_COMMAND_CHANNEL,
+    },
 };
 
 static LORA_RX_ACTIVITY_SIGNAL: Signal<CriticalSectionRawMutex, Instant> = Signal::new();
 
-#[cfg(feature = "lora-timing-debug")]
-const AUX_LOW_OBSERVE_TIMEOUT_MS: u64 = 15;
-
-#[cfg(feature = "lora-timing-debug")]
-fn now_us() -> u64 {
-    Instant::now().as_micros()
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[repr(u8)]
+enum LocalCommand {
+    StartLogging = 1,
+    StopLogging = 2,
+    GnssOn = 3,
+    GnssOff = 4,
 }
 
-#[cfg(feature = "lora-timing-debug")]
-fn print_timing_report(report: TimingReport) {
-    macro_rules! print_metric {
-        ($name:literal, $index:expr) => {{
-            let metric = report.metrics[$index];
-            println!(
-                concat!("  ", $name, ": count={} min={} max={} avg={}"),
-                metric.count, metric.min, metric.max, metric.average
-            );
-        }};
-    }
-
-    println!("LoRa TX timing us, samples=10");
-    print_metric!("request_interval", REQUEST_INTERVAL);
-    print_metric!("pre_aux_wait", PRE_AUX_WAIT);
-    print_metric!("initial_aux_wait", INITIAL_AUX_WAIT);
-    print_metric!("rx_guard_wait", RX_GUARD_WAIT);
-    print_metric!("post_guard_aux_wait", POST_GUARD_AUX_WAIT);
-    print_metric!("payload_prepare", PAYLOAD_PREPARE);
-    print_metric!("uart_write", UART_WRITE);
-    print_metric!("uart_flush", UART_FLUSH);
-    print_metric!("aux_low_delay", AUX_LOW_DELAY);
-    print_metric!("aux_low_duration", AUX_LOW_DURATION);
-    print_metric!("post_uart_to_done", POST_UART_TO_DONE);
-    print_metric!("tx_total", TX_TOTAL);
-    print_metric!("write_start_interval", WRITE_START_INTERVAL);
-    print_metric!("aux_done_interval", AUX_DONE_INTERVAL);
-    print_metric!("idle_gap", IDLE_GAP);
-    println!(
-        "  aux_low_not_observed={} periodic_requests={} top_trigger_requests={} idle_gap_invalid={}",
-        report.aux_low_not_observed,
-        report.periodic_requests,
-        report.top_trigger_requests,
-        report.idle_gap_invalid
-    );
-}
-
-const fn get_target_can_message(command: GroundCommand) -> Option<CanTxMessage> {
-    match command {
-        GroundCommand::StopSequence => Some(CanTxMessage::StopSequence { command: b'q' }),
-        GroundCommand::StartSequence => Some(CanTxMessage::StartSequence { command: b's' }),
-        GroundCommand::StartLogging => Some(CanTxMessage::StartLogging { command: b'l' }),
-        GroundCommand::StopLogging => Some(CanTxMessage::StopLogging { command: b'm' }),
-        GroundCommand::EmergencyStopPara => Some(CanTxMessage::EmergencyStopPara { command: b'z' }),
-        GroundCommand::StopFinControl => Some(CanTxMessage::StopFinControl { command: b'E' }),
-        GroundCommand::ClosePara => Some(CanTxMessage::ClosePara { command: b'c' }),
-        GroundCommand::OpenPara => Some(CanTxMessage::OpenPara { command: b'o' }),
-        GroundCommand::GnssOn | GroundCommand::GnssOff => None,
+impl LocalCommand {
+    const fn decode(raw: u8) -> Option<Self> {
+        match raw {
+            1 => Some(Self::StartLogging),
+            2 => Some(Self::StopLogging),
+            3 => Some(Self::GnssOn),
+            4 => Some(Self::GnssOff),
+            _ => None,
+        }
     }
 }
 
@@ -115,7 +71,6 @@ async fn wait_for_aux_high(aux_pin: &mut Input<'static>) -> bool {
     if aux_pin.is_high() {
         return true;
     }
-
     if with_timeout(
         Duration::from_millis(LORA_AUX_TIMEOUT_MS),
         aux_pin.wait_for_high(),
@@ -126,7 +81,6 @@ async fn wait_for_aux_high(aux_pin: &mut Input<'static>) -> bool {
     {
         return true;
     }
-
     LORA_AUX_TIMEOUT_COUNT.fetch_add(1, Ordering::Relaxed);
     println!("LoRa AUX timeout");
     false
@@ -137,7 +91,6 @@ async fn wait_for_rx_guard() {
         return;
     };
     let guard_duration = Duration::from_millis(LORA_RX_TX_GUARD_MS);
-
     loop {
         let deadline = last_rx + guard_duration;
         if deadline <= Instant::now() {
@@ -147,7 +100,6 @@ async fn wait_for_rx_guard() {
             last_rx = updated_rx;
             continue;
         }
-
         match select(LORA_RX_ACTIVITY_SIGNAL.wait(), Timer::at(deadline)).await {
             Either::First(updated_rx) => last_rx = updated_rx,
             Either::Second(()) => {
@@ -160,46 +112,19 @@ async fn wait_for_rx_guard() {
     }
 }
 
-async fn transmit_latest_payload(
+async fn transmit_frame(
     tx: &mut UartTx<'static, Async>,
     aux_pin: &mut Input<'static>,
-    #[cfg(feature = "lora-timing-debug")] timing: &mut TxTimingTrace,
+    frame: LoraFrame,
 ) {
-    #[cfg(feature = "lora-timing-debug")]
-    {
-        timing.t3 = Some(now_us());
-    }
-    let payload_bytes = {
-        let mut payload = PAYLOAD_MUTEX.lock().await;
-        payload.check_sum = payload.calculate_checksum();
-        payload.to_bytes()
-    };
-    #[cfg(feature = "lora-timing-debug")]
-    {
-        timing.t4 = Some(now_us());
-    }
-
     if !wait_for_aux_high(aux_pin).await {
         return;
-    }
-    #[cfg(feature = "lora-timing-debug")]
-    {
-        timing.t1 = Some(now_us());
     }
     wait_for_rx_guard().await;
-    #[cfg(feature = "lora-timing-debug")]
-    {
-        timing.t2 = Some(now_us());
-    }
     if !wait_for_aux_high(aux_pin).await {
         return;
     }
-
-    #[cfg(feature = "lora-timing-debug")]
-    {
-        timing.t5 = Some(now_us());
-    }
-    match write_all(tx, &payload_bytes).await {
+    match write_all(tx, frame.as_bytes()).await {
         Ok(true) => {}
         Ok(false) => {
             LORA_TX_ERROR_COUNT.fetch_add(1, Ordering::Relaxed);
@@ -211,130 +136,248 @@ async fn transmit_latest_payload(
             return;
         }
     }
-    #[cfg(feature = "lora-timing-debug")]
-    {
-        timing.t6 = Some(now_us());
-    }
     if let Err(error) = tx.flush_async().await {
         LORA_TX_ERROR_COUNT.fetch_add(1, Ordering::Relaxed);
         println!("LoRa UART flush error: {:?}", error);
         return;
     }
-    #[cfg(feature = "lora-timing-debug")]
+    let _ = wait_for_aux_high(aux_pin).await;
+}
+
+fn stale_or<T: Copy>(
+    latest: crate::can::cache::Latest<T>,
+    now_ms: u64,
+    maximum_age_ms: u64,
+) -> Option<T> {
+    if latest.freshness(now_ms, maximum_age_ms) == Freshness::Fresh {
+        latest.value()
+    } else {
+        None
+    }
+}
+
+async fn periodic_packet() -> Option<LoraFrame> {
+    let now_ms = Instant::now().as_millis();
+    let cache = *CAN_CACHE.lock().await;
+    let gnss = *GNSS_TELEMETRY.lock().await;
+    let mission = stale_or(cache.mission_status, now_ms, FRESHNESS_10_HZ_MS);
+    let state = mission.map_or(MissionState::Unknown, |value| value.state);
+    let kinematics = stale_or(cache.kinematics, now_ms, FRESHNESS_100_HZ_MS);
+    let control = stale_or(cache.control, now_ms, FRESHNESS_100_HZ_MS);
+    let tilt = stale_or(cache.attitude_tilt, now_ms, FRESHNESS_10_HZ_MS);
+    let lps = stale_or(cache.lps, now_ms, FRESHNESS_25_HZ_MS);
+    let airspeed = stale_or(cache.airspeed, now_ms, FRESHNESS_100_HZ_MS);
+    let power = stale_or(cache.power_time, now_ms, FRESHNESS_10_HZ_MS);
+
+    let packet = match state {
+        MissionState::CommandReceive | MissionState::Unknown => {
+            let mut status = mission.map_or(0, |value| {
+                u32::from(value.status) | (u32::from(value.config) << 16)
+            });
+            if !SD_HAS_ERROR.load(Ordering::Relaxed) {
+                status |= 1 << 11;
+            } else {
+                status &= !(1 << 11);
+            }
+            if !IS_CAN_ERROR.load(Ordering::Relaxed) {
+                status |= 1 << 12;
+            } else {
+                status &= !(1 << 12);
+            }
+            ApplicationPacket::CommandReceive(CommandReceiveTelemetry {
+                status,
+                motor_profile: 0xff,
+                tilt_magnitude: tilt.map_or(121, |value| value.magnitude),
+                tilt_direction: tilt.map_or(0, |value| value.direction),
+                fin_mode: mission.map_or(15, |value| value.fin_mode as u8),
+                para_mode: mission.map_or(15, |value| value.para_mode as u8),
+                fin_angle: kinematics.map_or(249, |value| value.fin_angle),
+                para_angle: mission.map_or(247, |value| value.para_angle),
+                pressure: lps.map_or(2039, |value| value.pressure),
+                temperature: lps.map_or(247, |value| value.temperature),
+                airspeed: airspeed.map_or(252, |value| value.airspeed),
+                logic_voltage: power.map_or(253, |value| value.logic_voltage),
+                motor_voltage: power.map_or(253, |value| value.motor_voltage),
+                east: gnss.east,
+                north: gnss.north,
+                height: gnss.height,
+            })
+        }
+        MissionState::LiftoffDetection | MissionState::EngineBurn | MissionState::Control => {
+            let header = match state {
+                MissionState::LiftoffDetection => PacketHeader::LiftoffDetection,
+                MissionState::EngineBurn => PacketHeader::EngineBurn,
+                _ => PacketHeader::Control,
+            };
+            ApplicationPacket::Flight(FlightTelemetry {
+                header,
+                status: mission.map_or(0, |value| value.status),
+                roll: kinematics.map_or(0x8004, |value| value.roll),
+                roll_rate: kinematics.map_or(0x8004, |value| value.roll_rate),
+                tilt_magnitude: tilt.map_or(123, |value| value.magnitude),
+                tilt_direction: tilt.map_or(0, |value| value.direction),
+                fin_angle: kinematics.map_or(249, |value| value.fin_angle),
+                fin_rate: kinematics.map_or(0x8002, |value| value.fin_rate),
+                pressure: lps.map_or(2039, |value| value.pressure),
+                temperature: lps.map_or(247, |value| value.temperature),
+                airspeed: airspeed.map_or(252, |value| value.airspeed),
+                requested_torque: control.map_or(0x800, |value| value.requested_torque),
+                elapsed: control.map_or(0xfa, |value| value.elapsed),
+                east: gnss.east,
+                north: gnss.north,
+                height: gnss.height,
+            })
+        }
+        MissionState::Descent => {
+            let descent = stale_or(cache.descent_core, now_ms, FRESHNESS_10_HZ_MS);
+            ApplicationPacket::Descent(DescentTelemetry {
+                status: descent.map_or(0, |value| value.status),
+                pressure: lps.map_or(2039, |value| value.pressure),
+                temperature: lps.map_or(247, |value| value.temperature),
+                para_angle: descent.map_or(247, |value| value.para_angle),
+                elapsed: power.map_or(0xfffa, |value| value.descent_elapsed),
+                east: gnss.east,
+                north: gnss.north,
+                height: gnss.height,
+            })
+        }
+    };
+    packet.encode().ok()
+}
+
+async fn queue_result(transaction_id: u8, command: u8, phase: CommandPhase, reason: CommandReason) {
+    if let Ok(frame) = ApplicationPacket::CommandResult(CommandResultPacket {
+        transaction_id,
+        command,
+        phase,
+        reason,
+        detail: 0,
+    })
+    .encode()
     {
-        timing.t7 = Some(now_us());
-        if aux_pin.is_low() {
-            timing.t8 = Some(now_us());
-        } else if with_timeout(
-            Duration::from_millis(AUX_LOW_OBSERVE_TIMEOUT_MS),
-            aux_pin.wait_for_low(),
-        )
-        .await
-        .is_ok()
-        {
-            timing.t8 = Some(now_us());
-        } else {
-            timing.aux_low_not_observed = true;
+        let _ = IMMEDIATE_LORA_CHANNEL.try_send(frame);
+    }
+}
+
+async fn process_generic(request: GenericCommandRequest) {
+    match COMMAND_TRACKER.lock().await.register(request) {
+        RegisterResult::Forward => {
+            CAN_TX_CHANNEL
+                .send(CanTxRequest {
+                    message: CanTxMessage::GenericCommandRequest(request),
+                })
+                .await;
+        }
+        RegisterResult::DuplicatePending => {}
+        RegisterResult::Replay(result) => {
+            if let Ok(frame) = ApplicationPacket::CommandResult(CommandResultPacket {
+                transaction_id: result.transaction_id,
+                command: result.command,
+                phase: result.phase,
+                reason: result.reason,
+                detail: result.detail,
+            })
+            .encode()
+            {
+                let _ = IMMEDIATE_LORA_CHANNEL.try_send(frame);
+            }
+        }
+        RegisterResult::ProtocolError => {
+            queue_result(
+                request.transaction_id,
+                request.command,
+                CommandPhase::Rejected,
+                CommandReason::ProtocolError,
+            )
+            .await;
+        }
+        RegisterResult::Busy => {
+            queue_result(
+                request.transaction_id,
+                request.command,
+                CommandPhase::Rejected,
+                CommandReason::Busy,
+            )
+            .await;
         }
     }
+}
 
-    if !wait_for_aux_high(aux_pin).await {
+async fn process_local(transaction_id: u8, command: u8, args: [u8; 6]) {
+    let Some(command_value) = LocalCommand::decode(command) else {
+        queue_result(
+            transaction_id,
+            command,
+            CommandPhase::Rejected,
+            CommandReason::NotSupported,
+        )
+        .await;
+        return;
+    };
+    if args.iter().any(|value| *value != 0) {
+        queue_result(
+            transaction_id,
+            command,
+            CommandPhase::Rejected,
+            CommandReason::InvalidArgument,
+        )
+        .await;
         return;
     }
-    #[cfg(feature = "lora-timing-debug")]
-    {
-        timing.t9 = Some(now_us());
+    match command_value {
+        LocalCommand::StartLogging => LOGGING_REQUESTED.store(true, Ordering::Relaxed),
+        LocalCommand::StopLogging => {
+            LOGGING_REQUESTED.store(false, Ordering::Relaxed);
+            SD_FLUSH_SIGNAL.signal(());
+        }
+        LocalCommand::GnssOn => GNSS_CMD_CHANNEL.send(GnssCommand::TurnOn).await,
+        LocalCommand::GnssOff => GNSS_CMD_CHANNEL.send(GnssCommand::TurnOff).await,
     }
+    queue_result(
+        transaction_id,
+        command,
+        CommandPhase::Completed,
+        CommandReason::None,
+    )
+    .await;
 }
 
 #[embassy_executor::task]
 pub async fn command_process_task() {
-    let mut next_generation = 0u32;
-
     loop {
-        let Some(command) = GroundCommand::decode_legacy(RECEIVED_DATA_CHANNEL.receive().await)
-        else {
-            continue;
-        };
-
-        let effects = command.acceptance_effects();
-        if let Some(logging_requested) = effects.logging_requested {
-            LOGGING_REQUESTED.store(logging_requested, Ordering::Relaxed);
-            if !logging_requested {
-                SD_FLUSH_SIGNAL.signal(());
+        match UPLINK_COMMAND_CHANNEL.receive().await {
+            UplinkCommand::MissionGeneric(request) => process_generic(request).await,
+            UplinkCommand::ActuatorEmergency { transaction_id } => {
+                CAN_SAFETY_TX_SIGNAL.signal(CanTxRequest {
+                    message: CanTxMessage::ActuatorEmergencyStop { transaction_id },
+                });
             }
-        }
-        if effects.gnss_turn_on {
-            GNSS_CMD_CHANNEL.send(GnssCommand::TurnOn).await;
-        }
-
-        match command {
-            GroundCommand::GnssOn => GNSS_CMD_CHANNEL.send(GnssCommand::TurnOn).await,
-            GroundCommand::GnssOff => GNSS_CMD_CHANNEL.send(GnssCommand::TurnOff).await,
-            _ => {}
-        }
-
-        if let Some(message) = get_target_can_message(command) {
-            next_generation = next_generation.wrapping_add(1);
-            let generation = next_generation;
-            match command.category() {
-                CommandCategory::Sequence => {
-                    LATEST_SEQUENCE_GENERATION.store(generation, Ordering::Relaxed)
-                }
-                CommandCategory::Logging => {
-                    LATEST_LOGGING_GENERATION.store(generation, Ordering::Relaxed)
-                }
-                CommandCategory::ParachutePosition => {
-                    LATEST_PARA_POSITION_GENERATION.store(generation, Ordering::Relaxed)
-                }
-                CommandCategory::Other => {}
+            UplinkCommand::LiftoffDetectionEmergency { transaction_id } => {
+                CAN_SAFETY_TX_SIGNAL.signal(CanTxRequest {
+                    message: CanTxMessage::LiftoffEmergencyStop { transaction_id },
+                });
             }
-
-            let request = if command.is_confirmed_by_controller_status() {
-                if HAS_VALID_CONTROLLER_STATUS.load(Ordering::Relaxed)
-                    && command_already_satisfied(
-                        command,
-                        crate::can::protocol::ControllerStatus::from_raw(
-                            CONTROLLER_STATUS_RAW.load(Ordering::Relaxed),
-                        )
-                        .sequence_active(),
-                    )
-                {
-                    *COMMAND_REQUEST_STATE.lock().await =
-                        CommandRequestState::already_satisfied(generation, command);
-                    println!("CAN command already satisfied: {:?}", command);
-                    continue;
-                }
-                let superseded = {
-                    let mut state = COMMAND_REQUEST_STATE.lock().await;
-                    if let Some(existing) = state.in_flight_command()
-                        && !may_supersede(existing, command)
-                    {
-                        println!("normal command rejected while safety request is pending");
-                        continue;
-                    }
-                    let superseded = if state.is_in_flight() {
-                        *state = state.supersede();
-                        state.failure()
-                    } else {
-                        None
-                    };
-                    *state = crate::can::command::CommandRequestState::queue(generation, command);
-                    superseded
-                };
-                if let Some(superseded) = superseded {
-                    *LAST_COMMAND_FAILURE.lock().await = Some(superseded);
-                    COMMAND_REQUEST_FAILURE_COUNT.fetch_add(1, Ordering::Relaxed);
-                    println!("superseding pending CAN command");
-                }
-                CanTxRequest::tracked(message, command, generation)
-            } else {
-                CanTxRequest::untracked(message, command, generation)
-            };
-            if command.priority() == CommandPriority::SafetyCritical {
-                CAN_SAFETY_TX_SIGNAL.signal(request);
-            } else {
-                CAN_TX_CHANNEL.send(request).await;
+            UplinkCommand::ComBoardLocal {
+                transaction_id,
+                command,
+                args,
+            } => process_local(transaction_id, command, args).await,
+            UplinkCommand::GroundTimeResponse {
+                request_id,
+                source,
+                unix_seconds,
+                milliseconds,
+            } => {
+                CAN_TX_CHANNEL
+                    .send(CanTxRequest {
+                        message: CanTxMessage::TimeResponse {
+                            request_id,
+                            source,
+                            unix_seconds,
+                            milliseconds,
+                        },
+                    })
+                    .await;
             }
         }
     }
@@ -344,17 +387,22 @@ pub async fn command_process_task() {
 pub async fn lora_rx_task(mut rx: UartRx<'static, Async>) {
     let mut rx_buf = [0u8; 32];
     let mut uplink_frame = UplinkFrameBuffer::new();
-
     loop {
         match rx.read_async(&mut rx_buf).await {
-            Ok(len) => {
-                for &byte in &rx_buf[..len] {
-                    if let Some(command) = uplink_frame.push(byte) {
+            Ok(length) => {
+                for byte in &rx_buf[..length] {
+                    if let Some(result) = uplink_frame.push(*byte) {
                         LORA_RX_ACTIVITY_SIGNAL.signal(Instant::now());
-                        if GroundCommand::decode_legacy(command).is_some()
-                            && RECEIVED_DATA_CHANNEL.try_send(command).is_err()
-                        {
-                            LORA_COMMAND_DROP_COUNT.fetch_add(1, Ordering::Relaxed);
+                        match result {
+                            Ok(command) => {
+                                if UPLINK_COMMAND_CHANNEL.try_send(command).is_err() {
+                                    LORA_COMMAND_DROP_COUNT.fetch_add(1, Ordering::Relaxed);
+                                }
+                            }
+                            Err(error) => {
+                                LORA_RX_ERROR_COUNT.fetch_add(1, Ordering::Relaxed);
+                                println!("invalid LoRa uplink: {:?}", error);
+                            }
                         }
                     }
                 }
@@ -375,33 +423,23 @@ pub async fn lora_rx_task(mut rx: UartRx<'static, Async>) {
 pub async fn lora_tx_task(mut tx: UartTx<'static, Async>, mut aux_pin: Input<'static>) {
     let interval = Duration::from_millis(LORA_TRANSMIT_INTERVAL_MS);
     let mut next_tx_at = Instant::now() + interval;
-    #[cfg(feature = "lora-timing-debug")]
-    let mut timing_collector = TimingCollector::new();
-
     loop {
-        Timer::at(next_tx_at).await;
-        #[cfg(feature = "lora-timing-debug")]
-        let mut timing = TxTimingTrace::new(now_us(), RequestSource::Periodic);
-
-        transmit_latest_payload(
-            &mut tx,
-            &mut aux_pin,
-            #[cfg(feature = "lora-timing-debug")]
-            &mut timing,
-        )
-        .await;
-
-        #[cfg(feature = "lora-timing-debug")]
-        if let Some(report) = timing_collector.record(timing) {
-            print_timing_report(report);
-        }
-
-        let scheduled_next = next_tx_at + interval;
-        let now = Instant::now();
-        next_tx_at = if scheduled_next <= now {
-            now + interval
-        } else {
-            scheduled_next
+        let frame = match select(IMMEDIATE_LORA_CHANNEL.receive(), Timer::at(next_tx_at)).await {
+            Either::First(frame) => frame,
+            Either::Second(()) => {
+                let scheduled_next = next_tx_at + interval;
+                let now = Instant::now();
+                next_tx_at = if scheduled_next <= now {
+                    now + interval
+                } else {
+                    scheduled_next
+                };
+                let Some(frame) = periodic_packet().await else {
+                    continue;
+                };
+                frame
+            }
         };
+        transmit_frame(&mut tx, &mut aux_pin, frame).await;
     }
 }

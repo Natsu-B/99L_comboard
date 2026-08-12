@@ -130,22 +130,22 @@ macro_rules! wire_enum {
 }
 
 wire_enum!(FinMode {
-    Coast = 0,
+    Free = 0,
     Brake = 1,
-    RollControl = 2,
+    PositionHold = 2,
     ZeroHold = 3,
-    Disabled = 4,
-    StoppedByLimit = 5,
+    RelativeMove = 4,
+    RollControl = 5,
     Unknown = 15,
 });
 
 wire_enum!(ParaMode {
-    Idle = 0,
-    Opening = 1,
-    HoldingOpen = 2,
-    Closing = 3,
-    PowerOff = 4,
-    Fault = 5,
+    Free = 0,
+    Hold = 1,
+    RelativeMove = 2,
+    OpeningOrRetrying = 3,
+    Closing = 4,
+    PoweredOff = 5,
     Unknown = 15,
 });
 
@@ -156,28 +156,28 @@ wire_enum!(TimeSource {
 });
 
 wire_enum!(RecoveryOpcode {
-    QueryStatus = 0,
-    Start = 1,
-    Read = 2,
-    Abort = 3,
+    EnterRecovery = 0,
+    Wake = 1,
+    StartLogDump = 2,
+    StopLogDump = 3,
 });
 
 wire_enum!(RecoverySource {
-    MissionFlash = 0,
-    CommunicationSd = 1,
+    InternalFlash = 0,
+    MissionSdLatestFlight = 1,
 });
 
 wire_enum!(RecoveryStatusCode {
     Ready = 0,
-    Active = 1,
-    Completed = 2,
-    InvalidRequest = 3,
-    Busy = 4,
-    NotAvailable = 5,
-    OutOfRange = 6,
+    Dumping = 1,
+    Complete = 2,
+    Busy = 3,
+    InvalidState = 4,
+    InvalidArgument = 5,
+    SourceUnavailable = 6,
     IoError = 7,
     Aborted = 8,
-    Timeout = 9,
+    InternalError = 9,
 });
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -664,8 +664,8 @@ mod tests {
         );
         assert_eq!(
             encoded(CanTxMessage::RecoveryControl(RecoveryControl {
-                opcode: RecoveryOpcode::Read,
-                source: RecoverySource::CommunicationSd,
+                opcode: RecoveryOpcode::StartLogDump,
+                source: RecoverySource::MissionSdLatestFlight,
                 transfer_id: 0x34,
                 offset: 0x012345,
                 length: 0x000456,
@@ -736,7 +736,7 @@ mod tests {
         let mut status = golden("CAN_102");
         status[5] = 6;
         assert!(CanRxMessage::decode_standard(CAN_ID_MISSION_STATUS, &status).is_err());
-        status[5] = FinMode::Coast as u8;
+        status[5] = FinMode::Free as u8;
         status[6] = 6;
         assert!(CanRxMessage::decode_standard(CAN_ID_MISSION_STATUS, &status).is_err());
 

@@ -4,12 +4,13 @@ use esp_hal::{
     twai::{self, EspTwaiError, EspTwaiFrame, StandardId},
 };
 
-use super::protocol::CanTxMessage;
+use super::protocol::{CanEncodeError, CanTxMessage};
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum CanFrameError {
     InvalidId(u16),
     InvalidPayloadLength(usize),
+    InvalidPayload(CanEncodeError),
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -31,7 +32,9 @@ pub async fn transmit_message_with_timeout(
 
 pub fn create_frame_from_message(msg: CanTxMessage) -> Result<EspTwaiFrame, CanFrameError> {
     let mut payload = [0u8; 8];
-    let len = msg.encode_payload(&mut payload);
+    let len = msg
+        .encode_payload(&mut payload)
+        .map_err(CanFrameError::InvalidPayload)?;
     let id = StandardId::new(msg.id()).ok_or(CanFrameError::InvalidId(msg.id()))?;
     EspTwaiFrame::new(id, &payload[..len]).ok_or(CanFrameError::InvalidPayloadLength(len))
 }
