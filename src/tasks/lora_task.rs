@@ -623,10 +623,10 @@ pub async fn lora_rx_task(mut rx: UartRx<'static, Async>) {
     loop {
         match rx.read_async(&mut rx_buf).await {
             Ok(length) => {
+                if length != 0 {
+                    LORA_RX_ACTIVITY_SIGNAL.signal(Instant::now());
+                }
                 for byte in &rx_buf[..length] {
-                    if *byte == 0x55 {
-                        LORA_RX_ACTIVITY_SIGNAL.signal(Instant::now());
-                    }
                     if let Some(result) = uplink_frame.push(*byte) {
                         LORA_RX_ACTIVITY_SIGNAL.signal(Instant::now());
                         match result {

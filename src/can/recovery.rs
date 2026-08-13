@@ -228,12 +228,7 @@ impl RecoveryAssembler {
             .expected_sequence
             .is_some_and(|expected| fragment.sequence != expected)
         {
-            let expected = self.expected_sequence.unwrap();
-            let missed = fragment.sequence.wrapping_sub(expected);
-            self.offset = self
-                .offset
-                .saturating_add(u32::from(self.data_length))
-                .saturating_add(u32::from(missed) * 6);
+            self.offset = self.offset.saturating_add(u32::from(self.data_length));
             self.data = [0; 16];
             self.data_length = 0;
             self.active = false;
@@ -276,18 +271,15 @@ impl RecoveryAssembler {
     }
 
     pub fn abort(&mut self) -> Option<RecoveryResume> {
-        if self.transfer_id == 0 {
-            return None;
-        }
-        let resume = RecoveryResume {
+        let resume = (self.transfer_id != 0).then_some(RecoveryResume {
             transfer_id: self.transfer_id,
             source: self.source,
             offset: self.offset.saturating_add(u32::from(self.data_length)),
-        };
+        });
         self.active = false;
         self.data = [0; 16];
         self.data_length = 0;
-        Some(resume)
+        resume
     }
 
     fn reached_end(&self) -> bool {
@@ -421,6 +413,7 @@ mod tests {
             Err(RecoveryAssemblyError::SequenceGap)
         );
         assert_eq!(assembler.finish(7), None);
+        assert_eq!(assembler.abort().unwrap().offset, 6);
     }
 
     #[test]

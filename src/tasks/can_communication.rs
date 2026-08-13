@@ -158,7 +158,7 @@ async fn queue_recovery_chunk(chunk: crate::can::recovery::RecoveryChunk) -> boo
 async fn fail_recovery_transfer(reason: crate::can::protocol::CommandReason, stop_mission: bool) {
     let resume = RECOVERY_ASSEMBLER.lock().await.abort();
     if stop_mission && let Some(resume) = resume {
-        let _ = CAN_TX_CHANNEL.try_send(crate::state::CanTxRequest {
+        let _ = CAN_SAFETY_TX_CHANNEL.try_send(crate::state::CanTxRequest {
             message: CanTxMessage::RecoveryControl(RecoveryControl {
                 opcode: RecoveryOpcode::StopLogDump,
                 source: resume.source,

@@ -86,7 +86,7 @@ cargo check --test gnss_setting_response --features hardware-test \
 
 - ComBoard側の問題により、今回のflash/boot、Mission↔Com CAN、Com↔Ground LoRa、GNSS receiver ACK/fix/stale、SD書込みの実機検証は未実施です。
 - GNSS設定は各UBX commandのACK/NAKを検証しますが、最後のbaud変更commandはbaud切替を伴うためACK未確認です。
-- GGAから位置/fixを取得します。NMEA日付をUnix時刻へ変換するperiodic GNSS `TimeSync`は未実装で、MissionのTimeRequestはGround B1/B0経路を使用します。
+- GGAから位置/fixを取得します。NMEA日付をUnix時刻へ変換するperiodic GNSS `TimeSync`は未実装で、MissionのTimeRequestはB1とGroundTimeResponse uplinkの経路を使用します。
 - A0/A6/B0/B1 layout、A0 status割当、local command code、freshness、Recovery rateはVaultの実装仮定台帳に記録した暫定値です。
 - A6はRAM上の16-byte queueへspoolします。通信基板microSDへの全Recovery dump spoolと自動resume requestは未実装です。
 - 実機の100 Hz CAN負荷、Emergency end-to-end latency、E220 packet loss、GNSS屋外fixはhardware復旧後に測定が必要です。
