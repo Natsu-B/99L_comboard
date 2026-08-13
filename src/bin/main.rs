@@ -10,7 +10,15 @@
 use core::sync::atomic::Ordering;
 
 use c99l_comboard::{
-    state::IS_CAN_ERROR,
+    state::{
+        CAN_HEALTH, CAN_REC, CAN_RX_ERROR_COUNT, CAN_RX_SUCCESS_COUNT, CAN_TEC, CAN_TX_ERROR_COUNT,
+        CAN_TX_SUCCESS_COUNT, GNSS_CHANNEL_DROP_COUNT, GNSS_RX_ERROR_COUNT,
+        GNSS_SETTING_ERROR_COUNT, GNSS_TELEMETRY, HAS_UNFLUSHED_DATA, IS_CAN_ERROR, LOGGING_ACTIVE,
+        LOGGING_REQUESTED, LORA_AUX_TIMEOUT_COUNT, LORA_COMMAND_DROP_COUNT, LORA_RX_BYTE_COUNT,
+        LORA_RX_ERROR_COUNT, LORA_RX_SUCCESS_COUNT, LORA_TX_ERROR_COUNT, LORA_TX_QUEUE_DROP_COUNT,
+        LORA_TX_SUCCESS_COUNT, RAW_CAN_LOG_DROPPED_COUNT, SD_DROPPED_ROW_COUNT, SD_HAS_ERROR,
+        SD_WRITE_ERROR_COUNT,
+    },
     tasks::{
         SdTimeSource, SdVolumeManager, can_communication_task, command_process_task,
         gnss_manager_task, lora_rx_task, lora_tx_task, parse_gnss_task, sd_write_task,
@@ -179,11 +187,51 @@ async fn main(spawner0: Spawner) -> ! {
         },
     );
 
+    let mut hwstat_ticks = 0u8;
     loop {
         if IS_CAN_ERROR.load(Ordering::Relaxed) {
             led1.toggle();
         } else {
             led1.set_low();
+        }
+
+        hwstat_ticks += 1;
+        if hwstat_ticks == 100 {
+            hwstat_ticks = 0;
+            let gnss = *GNSS_TELEMETRY.lock().await;
+            println!(
+                "HWSTAT can_err={} can_health={} tec={} rec={} can_tx_ok={} can_rx_ok={} can_tx_err={} can_rx_err={} lora_tx_ok={} lora_rx_ok={} lora_rx_bytes={} lora_tx_err={} lora_rx_err={} lora_aux_timeout={} lora_tx_qdrop={} lora_cmd_drop={} sd_req={} sd_active={} sd_error={} sd_dirty={} sd_write_err={} sd_row_drop={} can_log_drop={} gnss={:?} east={} north={} height={} gnss_setting_err={} gnss_rx_err={} gnss_drop={}",
+                IS_CAN_ERROR.load(Ordering::Relaxed),
+                CAN_HEALTH.load(Ordering::Relaxed),
+                CAN_TEC.load(Ordering::Relaxed),
+                CAN_REC.load(Ordering::Relaxed),
+                CAN_TX_SUCCESS_COUNT.load(Ordering::Relaxed),
+                CAN_RX_SUCCESS_COUNT.load(Ordering::Relaxed),
+                CAN_TX_ERROR_COUNT.load(Ordering::Relaxed),
+                CAN_RX_ERROR_COUNT.load(Ordering::Relaxed),
+                LORA_TX_SUCCESS_COUNT.load(Ordering::Relaxed),
+                LORA_RX_SUCCESS_COUNT.load(Ordering::Relaxed),
+                LORA_RX_BYTE_COUNT.load(Ordering::Relaxed),
+                LORA_TX_ERROR_COUNT.load(Ordering::Relaxed),
+                LORA_RX_ERROR_COUNT.load(Ordering::Relaxed),
+                LORA_AUX_TIMEOUT_COUNT.load(Ordering::Relaxed),
+                LORA_TX_QUEUE_DROP_COUNT.load(Ordering::Relaxed),
+                LORA_COMMAND_DROP_COUNT.load(Ordering::Relaxed),
+                LOGGING_REQUESTED.load(Ordering::Relaxed),
+                LOGGING_ACTIVE.load(Ordering::Relaxed),
+                SD_HAS_ERROR.load(Ordering::Relaxed),
+                HAS_UNFLUSHED_DATA.load(Ordering::Relaxed),
+                SD_WRITE_ERROR_COUNT.load(Ordering::Relaxed),
+                SD_DROPPED_ROW_COUNT.load(Ordering::Relaxed),
+                RAW_CAN_LOG_DROPPED_COUNT.load(Ordering::Relaxed),
+                gnss.state,
+                gnss.east,
+                gnss.north,
+                gnss.height,
+                GNSS_SETTING_ERROR_COUNT.load(Ordering::Relaxed),
+                GNSS_RX_ERROR_COUNT.load(Ordering::Relaxed),
+                GNSS_CHANNEL_DROP_COUNT.load(Ordering::Relaxed),
+            );
         }
 
         Timer::after(Duration::from_millis(100)).await;

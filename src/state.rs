@@ -95,6 +95,8 @@ pub static GNSS_CHANNEL: Channel<CriticalSectionRawMutex, GnssPacket, 5> = Chann
 pub static GNSS_CMD_CHANNEL: Channel<CriticalSectionRawMutex, GnssCommand, 2> = Channel::new();
 pub static UPLINK_COMMAND_CHANNEL: Channel<CriticalSectionRawMutex, UplinkCommand, 8> =
     Channel::new();
+pub static EMERGENCY_RESULT_LORA_CHANNEL: Channel<CriticalSectionRawMutex, LoraFrame, 16> =
+    Channel::new();
 pub static IMMEDIATE_LORA_CHANNEL: Channel<CriticalSectionRawMutex, LoraFrame, 8> = Channel::new();
 pub static RECOVERY_LORA_CHANNEL: Channel<CriticalSectionRawMutex, LoraFrame, 16> = Channel::new();
 pub static RAW_CAN_LOG_CHANNEL: Channel<CriticalSectionRawMutex, RawCanRecord, 32> = Channel::new();
@@ -113,10 +115,16 @@ pub static IS_CAN_ERROR: AtomicBool = AtomicBool::new(true);
 pub static CAN_TEC: AtomicU8 = AtomicU8::new(0);
 pub static CAN_REC: AtomicU8 = AtomicU8::new(0);
 pub static CAN_HEALTH: AtomicU8 = AtomicU8::new(0);
+pub static CAN_TX_SUCCESS_COUNT: AtomicU32 = AtomicU32::new(0);
+pub static CAN_RX_SUCCESS_COUNT: AtomicU32 = AtomicU32::new(0);
 pub static CAN_TX_ERROR_COUNT: AtomicU32 = AtomicU32::new(0);
 pub static CAN_RX_ERROR_COUNT: AtomicU32 = AtomicU32::new(0);
+pub static LORA_TX_SUCCESS_COUNT: AtomicU32 = AtomicU32::new(0);
+pub static LORA_RX_SUCCESS_COUNT: AtomicU32 = AtomicU32::new(0);
+pub static LORA_RX_BYTE_COUNT: AtomicU32 = AtomicU32::new(0);
 pub static LORA_TX_ERROR_COUNT: AtomicU32 = AtomicU32::new(0);
 pub static LORA_RX_ERROR_COUNT: AtomicU32 = AtomicU32::new(0);
+pub static LORA_TX_QUEUE_DROP_COUNT: AtomicU32 = AtomicU32::new(0);
 pub static LORA_COMMAND_DROP_COUNT: AtomicU32 = AtomicU32::new(0);
 pub static LORA_AUX_TIMEOUT_COUNT: AtomicU32 = AtomicU32::new(0);
 pub static GNSS_SETTING_ERROR_COUNT: AtomicU32 = AtomicU32::new(0);

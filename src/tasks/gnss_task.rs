@@ -115,7 +115,22 @@ pub async fn gnss_manager_task(mut uart: Uart<'static, Async>, mut gnss_en: Outp
                         gnss_en.set_low();
                         continue;
                     }
-                    Timer::after(Duration::from_millis(500)).await;
+                    // receiver起動時のNMEAを待機中も読み、UART FIFO overflowを防ぐ。
+                    let startup_deadline = Instant::now() + Duration::from_millis(500);
+                    loop {
+                        match select(uart.read_async(&mut read_buf), Timer::at(startup_deadline))
+                            .await
+                        {
+                            Either::First(Ok(_)) => {}
+                            Either::First(Err(error)) => {
+                                GNSS_RX_ERROR_COUNT.fetch_add(1, Ordering::Relaxed);
+                                println!("GNSS startup UART receive error: {:?}", error);
+                            }
+                            Either::Second(()) => break,
+                        }
+                    }
+                    line_length = 0;
+                    discard_line = false;
                     match gnss_setting(&mut uart).await {
                         Ok(report) => println!(
                             "GNSS configuration ACK count={}, final baud ACK unverified={}",
@@ -144,11 +159,15 @@ pub async fn gnss_manager_task(mut uart: Uart<'static, Async>, mut gnss_en: Outp
                 GnssCommand::TurnOff => {
                     gnss_en.set_low();
                     is_on = false;
-                    let mut telemetry = GNSS_TELEMETRY.lock().await;
-                    telemetry.state = GnssReceiverState::Off;
-                    telemetry.east = GNSS_COORDINATE_UNAVAILABLE;
-                    telemetry.north = GNSS_COORDINATE_UNAVAILABLE;
-                    telemetry.height = GNSS_HEIGHT_UNAVAILABLE;
+                    {
+                        let mut telemetry = GNSS_TELEMETRY.lock().await;
+                        telemetry.state = GnssReceiverState::Off;
+                        telemetry.east = GNSS_COORDINATE_UNAVAILABLE;
+                        telemetry.north = GNSS_COORDINATE_UNAVAILABLE;
+                        telemetry.height = GNSS_HEIGHT_UNAVAILABLE;
+                    }
+                    // 再ON後にOFF前のsentenceを再利用しない。
+                    while GNSS_CHANNEL.try_receive().is_ok() {}
                 }
             },
         }
@@ -165,11 +184,30 @@ pub async fn parse_gnss_task() {
     loop {
         match select(GNSS_CHANNEL.receive(), stale_ticker.next()).await {
             Either::First(sentence) => {
+                if matches!(
+                    GNSS_TELEMETRY.lock().await.state,
+                    GnssReceiverState::Off
+                        | GnssReceiverState::Starting
+                        | GnssReceiverState::ConfigurationFailed
+                ) {
+                    continue;
+                }
                 if !is_gga(&sentence) {
                     continue;
                 }
                 let now_ms = Instant::now().as_millis();
-                match parse_gga(sentence.as_slice()) {
+                let parsed = parse_gga(sentence.as_slice());
+                let mut telemetry = GNSS_TELEMETRY.lock().await;
+                // parse中にTurnOffされた場合も、古いGGAでOffを上書きしない。
+                if matches!(
+                    telemetry.state,
+                    GnssReceiverState::Off
+                        | GnssReceiverState::Starting
+                        | GnssReceiverState::ConfigurationFailed
+                ) {
+                    continue;
+                }
+                match parsed {
                     Ok(data)
                         if data.fix_quality != FixQuality::Invalid
                             && data.latitude.is_some()
@@ -181,7 +219,6 @@ pub async fn parse_gnss_task() {
                             data.longitude.unwrap(),
                             data.altitude.unwrap(),
                         );
-                        let mut telemetry = GNSS_TELEMETRY.lock().await;
                         telemetry.state = GnssReceiverState::ValidFix;
                         telemetry.east = encoded.east;
                         telemetry.north = encoded.north;
@@ -189,14 +226,12 @@ pub async fn parse_gnss_task() {
                         telemetry.last_fix_at_ms = Some(now_ms);
                     }
                     Ok(_) => {
-                        let mut telemetry = GNSS_TELEMETRY.lock().await;
                         telemetry.state = GnssReceiverState::NoFix;
                         telemetry.east = GNSS_COORDINATE_NO_FIX;
                         telemetry.north = GNSS_COORDINATE_NO_FIX;
                         telemetry.height = GNSS_HEIGHT_NO_FIX;
                     }
                     Err(_) => {
-                        let mut telemetry = GNSS_TELEMETRY.lock().await;
                         telemetry.state = GnssReceiverState::InvalidSample;
                         telemetry.east = GNSS_COORDINATE_INVALID;
                         telemetry.north = GNSS_COORDINATE_INVALID;

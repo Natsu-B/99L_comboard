@@ -8,6 +8,21 @@ pub const FRESHNESS_100_HZ_MS: u64 = 30;
 pub const FRESHNESS_25_HZ_MS: u64 = 120;
 pub const FRESHNESS_10_HZ_MS: u64 = 300;
 
+pub fn observed_sequence(identifier: u16, data: &[u8]) -> Option<u8> {
+    match identifier {
+        0x020 | 0x100..=0x104 | 0x107..=0x109 => data.first().copied(),
+        0x106 => data.get(1).copied(),
+        _ => None,
+    }
+}
+
+pub const fn sequence_gap(previous: Option<u8>, current: u8) -> bool {
+    match previous {
+        Some(previous) => current != previous.wrapping_add(1),
+        None => false,
+    }
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Freshness {
     Missing,
@@ -261,6 +276,15 @@ mod tests {
             cache.airspeed.freshness(99, FRESHNESS_100_HZ_MS),
             Freshness::Stale
         );
+    }
+
+    #[test]
+    fn observed_sequence_offsets_and_wrap_are_checked() {
+        assert_eq!(observed_sequence(0x100, &[7]), Some(7));
+        assert_eq!(observed_sequence(0x106, &[9, 8]), Some(8));
+        assert_eq!(observed_sequence(0x011, &[7]), None);
+        assert!(!sequence_gap(Some(255), 0));
+        assert!(sequence_gap(Some(10), 12));
     }
 
     #[test]

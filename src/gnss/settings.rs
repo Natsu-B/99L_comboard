@@ -184,7 +184,8 @@ pub async fn gnss_setting(tx: &mut GnssUart) -> Result<GnssSettingReport, GnssSe
         }
         let class = cmd[2];
         let id = cmd[3];
-        match with_timeout(Duration::from_millis(500), wait_for_ack(tx, class, id)).await {
+        // 起動直後の最初のACKはboot NMEAと競合し、実機で約620 msかかる。
+        match with_timeout(Duration::from_millis(1_000), wait_for_ack(tx, class, id)).await {
             Ok(Ok(AckOutcome::Ack)) => {
                 acknowledged_commands = acknowledged_commands.saturating_add(1)
             }
@@ -218,7 +219,8 @@ mod tests {
             0,
             0,
         ];
-        for value in bytes[2..8].to_vec() {
+        for index in 2..8 {
+            let value = bytes[index];
             bytes[8] = bytes[8].wrapping_add(value);
             bytes[9] = bytes[9].wrapping_add(bytes[8]);
         }

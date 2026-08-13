@@ -1,6 +1,6 @@
 use core::sync::atomic::Ordering;
 
-use embassy_futures::select::{Either, Either3, select, select3};
+use embassy_futures::select::{Either, Either4, select, select4};
 use embassy_sync::{blocking_mutex::raw::CriticalSectionRawMutex, signal::Signal};
 use embassy_time::{Duration, Instant, Timer, with_timeout};
 use esp_hal::{
@@ -20,7 +20,10 @@ use crate::{
         },
         recovery::PendingRecovery,
     },
-    constants::{LORA_AUX_TIMEOUT_MS, LORA_RX_TX_GUARD_MS, LORA_TRANSMIT_INTERVAL_MS},
+    constants::{
+        LORA_AUX_TIMEOUT_MS, LORA_POST_TX_RX_WINDOW_MS, LORA_RX_TX_GUARD_MS,
+        LORA_TRANSMIT_INTERVAL_MS,
+    },
     lora_uplink::{UplinkCommand, UplinkFrameBuffer},
     payload::{
         ApplicationPacket, CommandReceiveTelemetry, CommandResultPacket, DescentTelemetry,
@@ -28,11 +31,12 @@ use crate::{
     },
     state::{
         CAN_CACHE, CAN_SAFETY_TX_CHANNEL, CAN_TX_CHANNEL, COMMAND_TRACKER, CanTxRequest,
-        GNSS_CMD_CHANNEL, GNSS_TELEMETRY, GnssCommand, IMMEDIATE_LORA_CHANNEL, IS_CAN_ERROR,
-        LOGGING_REQUESTED, LORA_AUX_TIMEOUT_COUNT, LORA_COMMAND_DROP_COUNT, LORA_RX_ERROR_COUNT,
-        LORA_TX_ERROR_COUNT, RECOVERY_ASSEMBLER, RECOVERY_BEACON_ACTIVE, RECOVERY_ENTER_SENT,
-        RECOVERY_LORA_CHANNEL, RECOVERY_SESSION, SD_FLUSH_SIGNAL, SD_HAS_ERROR,
-        UPLINK_COMMAND_CHANNEL,
+        EMERGENCY_RESULT_LORA_CHANNEL, GNSS_CMD_CHANNEL, GNSS_TELEMETRY, GnssCommand,
+        IMMEDIATE_LORA_CHANNEL, IS_CAN_ERROR, LOGGING_REQUESTED, LORA_AUX_TIMEOUT_COUNT,
+        LORA_COMMAND_DROP_COUNT, LORA_RX_BYTE_COUNT, LORA_RX_ERROR_COUNT, LORA_RX_SUCCESS_COUNT,
+        LORA_TX_ERROR_COUNT, LORA_TX_QUEUE_DROP_COUNT, LORA_TX_SUCCESS_COUNT, RECOVERY_ASSEMBLER,
+        RECOVERY_BEACON_ACTIVE, RECOVERY_ENTER_SENT, RECOVERY_LORA_CHANNEL, RECOVERY_SESSION,
+        SD_FLUSH_SIGNAL, SD_HAS_ERROR, UPLINK_COMMAND_CHANNEL,
     },
 };
 
@@ -155,7 +159,12 @@ async fn transmit_frame(
         println!("LoRa UART flush error: {:?}", error);
         return false;
     }
-    wait_for_aux_high(aux_pin).await
+    if wait_for_aux_high(aux_pin).await {
+        LORA_TX_SUCCESS_COUNT.fetch_add(1, Ordering::Relaxed);
+        true
+    } else {
+        false
+    }
 }
 
 fn stale_or<T: Copy>(
@@ -404,8 +413,9 @@ async fn queue_result(transaction_id: u8, command: u8, phase: CommandPhase, reas
         detail: 0,
     })
     .encode()
+        && IMMEDIATE_LORA_CHANNEL.try_send(frame).is_err()
     {
-        let _ = IMMEDIATE_LORA_CHANNEL.try_send(frame);
+        LORA_TX_QUEUE_DROP_COUNT.fetch_add(1, Ordering::Relaxed);
     }
 }
 
@@ -428,8 +438,9 @@ async fn process_generic(request: GenericCommandRequest) {
                 detail: result.detail,
             })
             .encode()
+                && IMMEDIATE_LORA_CHANNEL.try_send(frame).is_err()
             {
-                let _ = IMMEDIATE_LORA_CHANNEL.try_send(frame);
+                LORA_TX_QUEUE_DROP_COUNT.fetch_add(1, Ordering::Relaxed);
             }
         }
         RegisterResult::ProtocolError => {
@@ -625,6 +636,7 @@ pub async fn lora_rx_task(mut rx: UartRx<'static, Async>) {
     loop {
         match rx.read_async(&mut rx_buf).await {
             Ok(length) => {
+                LORA_RX_BYTE_COUNT.fetch_add(length as u32, Ordering::Relaxed);
                 if length != 0 {
                     LORA_RX_ACTIVITY_SIGNAL.signal(Instant::now());
                 }
@@ -632,31 +644,34 @@ pub async fn lora_rx_task(mut rx: UartRx<'static, Async>) {
                     if let Some(result) = uplink_frame.push(*byte) {
                         LORA_RX_ACTIVITY_SIGNAL.signal(Instant::now());
                         match result {
-                            Ok(command) => match command {
-                                UplinkCommand::ActuatorEmergency { transaction_id } => {
-                                    CAN_SAFETY_TX_CHANNEL
-                                        .send(CanTxRequest {
-                                            message: CanTxMessage::ActuatorEmergencyStop {
-                                                transaction_id,
-                                            },
-                                        })
-                                        .await;
-                                }
-                                UplinkCommand::LiftoffDetectionEmergency { transaction_id } => {
-                                    CAN_SAFETY_TX_CHANNEL
-                                        .send(CanTxRequest {
-                                            message: CanTxMessage::LiftoffEmergencyStop {
-                                                transaction_id,
-                                            },
-                                        })
-                                        .await;
-                                }
-                                command => {
-                                    if UPLINK_COMMAND_CHANNEL.try_send(command).is_err() {
-                                        LORA_COMMAND_DROP_COUNT.fetch_add(1, Ordering::Relaxed);
+                            Ok(command) => {
+                                LORA_RX_SUCCESS_COUNT.fetch_add(1, Ordering::Relaxed);
+                                match command {
+                                    UplinkCommand::ActuatorEmergency { transaction_id } => {
+                                        CAN_SAFETY_TX_CHANNEL
+                                            .send(CanTxRequest {
+                                                message: CanTxMessage::ActuatorEmergencyStop {
+                                                    transaction_id,
+                                                },
+                                            })
+                                            .await;
+                                    }
+                                    UplinkCommand::LiftoffDetectionEmergency { transaction_id } => {
+                                        CAN_SAFETY_TX_CHANNEL
+                                            .send(CanTxRequest {
+                                                message: CanTxMessage::LiftoffEmergencyStop {
+                                                    transaction_id,
+                                                },
+                                            })
+                                            .await;
+                                    }
+                                    command => {
+                                        if UPLINK_COMMAND_CHANNEL.try_send(command).is_err() {
+                                            LORA_COMMAND_DROP_COUNT.fetch_add(1, Ordering::Relaxed);
+                                        }
                                     }
                                 }
-                            },
+                            }
                             Err(error) => {
                                 LORA_RX_ERROR_COUNT.fetch_add(1, Ordering::Relaxed);
                                 println!("invalid LoRa uplink: {:?}", error);
@@ -693,15 +708,17 @@ pub async fn lora_tx_task(mut tx: UartTx<'static, Async>, mut aux_pin: Input<'st
                 RECOVERY_LORA_CHANNEL.receive().await
             }
         };
-        let (frame, interval_events, event_revision) = match select3(
+        // select4は左からpollするため、Emergency resultを常に優先する。
+        let (frame, interval_events, event_revision) = match select4(
+            EMERGENCY_RESULT_LORA_CHANNEL.receive(),
             IMMEDIATE_LORA_CHANNEL.receive(),
             Timer::at(next_tx_at),
             recovery_ready,
         )
         .await
         {
-            Either3::First(frame) => (frame, 0, 0),
-            Either3::Second(()) => {
+            Either4::First(frame) | Either4::Second(frame) => (frame, 0, 0),
+            Either4::Third(()) => {
                 interval = Duration::from_millis(periodic_interval_ms(
                     RECOVERY_BEACON_ACTIVE.load(Ordering::Relaxed),
                 ));
@@ -717,21 +734,28 @@ pub async fn lora_tx_task(mut tx: UartTx<'static, Async>, mut aux_pin: Input<'st
                 };
                 frame
             }
-            Either3::Third(frame) if had_pending_recovery || Instant::now() >= next_recovery_at => {
+            Either4::Fourth(frame)
+                if had_pending_recovery || Instant::now() >= next_recovery_at =>
+            {
                 pending_recovery = None;
                 next_recovery_at = Instant::now() + Duration::from_millis(RECOVERY_LOG_INTERVAL_MS);
                 (frame, 0, 0)
             }
-            Either3::Third(frame) => {
+            Either4::Fourth(frame) => {
                 pending_recovery = Some(frame);
                 continue;
             }
         };
-        if transmit_frame(&mut tx, &mut aux_pin, frame).await && interval_events != 0 {
+        const RX_WINDOW: Duration = Duration::from_millis(LORA_POST_TX_RX_WINDOW_MS);
+        let transmitted = transmit_frame(&mut tx, &mut aux_pin, frame).await;
+        if transmitted && interval_events != 0 {
             CAN_CACHE
                 .lock()
                 .await
                 .clear_event_flags(interval_events, event_revision);
+        }
+        if transmitted {
+            Timer::after(RX_WINDOW).await;
         }
     }
 }

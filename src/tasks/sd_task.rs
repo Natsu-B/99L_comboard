@@ -180,6 +180,10 @@ pub async fn sd_write_task(
                 SD_WRITE_ERROR_COUNT.fetch_add(1, Ordering::Relaxed);
             }
         }
+        if !LOGGING_REQUESTED.load(Ordering::Relaxed) {
+            LOGGING_ACTIVE.store(false, Ordering::Relaxed);
+            sd_logging_led.set_low();
+        }
         HAS_UNFLUSHED_DATA.store(cursor > 0, Ordering::Relaxed);
     }
 }

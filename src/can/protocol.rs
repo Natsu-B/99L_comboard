@@ -17,6 +17,24 @@ pub const CAN_ID_ATTITUDE_TILT: u16 = 0x107;
 pub const CAN_ID_LPS: u16 = 0x108;
 pub const CAN_ID_AIRSPEED: u16 = 0x109;
 
+#[cfg(any(target_arch = "xtensa", test))]
+pub(crate) const ACTUATOR_EMERGENCY_RESULT: u8 = 0xF0;
+#[cfg(any(target_arch = "xtensa", test))]
+pub(crate) const LIFTOFF_EMERGENCY_RESULT: u8 = 0xF1;
+
+#[cfg(any(target_arch = "xtensa", test))]
+pub(crate) const fn is_emergency_result_command(command: u8) -> bool {
+    matches!(
+        command,
+        ACTUATOR_EMERGENCY_RESULT | LIFTOFF_EMERGENCY_RESULT
+    )
+}
+
+#[cfg(any(target_arch = "xtensa", test))]
+pub(crate) const fn prioritize_untracked_emergency_result(matched: bool, command: u8) -> bool {
+    !matched && is_emergency_result_command(command)
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 #[repr(u8)]
 pub enum MissionState {
@@ -221,6 +239,26 @@ pub struct CommandResult {
     pub phase: CommandPhase,
     pub reason: CommandReason,
     pub detail: u32,
+}
+
+#[cfg(any(target_arch = "xtensa", test))]
+pub(crate) const fn emergency_failure_result(message: CanTxMessage) -> Option<CommandResult> {
+    let (transaction_id, command) = match message {
+        CanTxMessage::ActuatorEmergencyStop { transaction_id } => {
+            (transaction_id, ACTUATOR_EMERGENCY_RESULT)
+        }
+        CanTxMessage::LiftoffEmergencyStop { transaction_id } => {
+            (transaction_id, LIFTOFF_EMERGENCY_RESULT)
+        }
+        _ => return None,
+    };
+    Some(CommandResult {
+        transaction_id,
+        command,
+        phase: CommandPhase::Failed,
+        reason: CommandReason::Timeout,
+        detail: 0,
+    })
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -688,6 +726,54 @@ mod tests {
                 milliseconds: 999,
             }),
             golden("CAN_013")
+        );
+    }
+
+    #[test]
+    fn emergency_transmit_failure_maps_to_terminal_result() {
+        assert_eq!(
+            emergency_failure_result(CanTxMessage::ActuatorEmergencyStop {
+                transaction_id: 0x2a,
+            }),
+            Some(CommandResult {
+                transaction_id: 0x2a,
+                command: ACTUATOR_EMERGENCY_RESULT,
+                phase: CommandPhase::Failed,
+                reason: CommandReason::Timeout,
+                detail: 0,
+            })
+        );
+        assert_eq!(
+            emergency_failure_result(CanTxMessage::LiftoffEmergencyStop {
+                transaction_id: 0x2b,
+            }),
+            Some(CommandResult {
+                transaction_id: 0x2b,
+                command: LIFTOFF_EMERGENCY_RESULT,
+                phase: CommandPhase::Failed,
+                reason: CommandReason::Timeout,
+                detail: 0,
+            })
+        );
+        assert!(is_emergency_result_command(ACTUATOR_EMERGENCY_RESULT));
+        assert!(is_emergency_result_command(LIFTOFF_EMERGENCY_RESULT));
+        assert!(!is_emergency_result_command(0x02));
+        assert!(prioritize_untracked_emergency_result(
+            false,
+            ACTUATOR_EMERGENCY_RESULT
+        ));
+        assert!(!prioritize_untracked_emergency_result(
+            true,
+            ACTUATOR_EMERGENCY_RESULT
+        ));
+        assert!(!prioritize_untracked_emergency_result(false, 0x02));
+        assert_eq!(
+            emergency_failure_result(CanTxMessage::GenericCommandRequest(GenericCommandRequest {
+                transaction_id: 0x2c,
+                command: ACTUATOR_EMERGENCY_RESULT,
+                args: [0; 6],
+            })),
+            None
         );
     }
 

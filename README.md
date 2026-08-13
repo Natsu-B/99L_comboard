@@ -37,7 +37,7 @@ espflash flash --chip esp32s3 --port /dev/ttyACM<N> \
   target/xtensa-esp32s3-none-elf/release/c99l_comboard
 ```
 
-本作業環境ではユーザー確認により`/dev/ttyACM3`がComBoardですが、基板側の問題が発生したため、今回のflash/boot/実機通信試験は意図的に実施していません。
+2026-08-14の3基板実機試験では`/dev/ttyACM0`を使用しました。portは環境ごとに変わるため、通常はUSB identityを照合してから指定してください。実測結果は[docs/hardware_test_results.md](docs/hardware_test_results.md)に記録しています。
 
 ## Protocol
 
@@ -62,7 +62,7 @@ Recovery A6はtransfer IDとsequenceを検証します。gap、encode失敗、Lo
 - ESP32-S3、TWAI GPIO7/16、LoRa UART2 GPIO11/12、AUX GPIO8。
 - GNSS UART1 GPIO14/21、enable GPIO13。9600 baudで設定後115200 baudへ切替。
 - SD SPI GPIO41/42/40、CS GPIO2。既存PHY、pin、LED、task配置は変更していません。
-- E220の固定address/channel、RSSI付加、AUX timeoutは実機readbackが必要です。
+- Ground/ComBoard双方のE220 register readbackは`C1 00 08 00 00 EC 81 04 C3 00 00`で一致しました。搭載moduleの正確な型番を一次資料で確定できていないため、fieldの意味はこのrepositoryでは推測しません。
 
 ## Test
 
@@ -75,18 +75,24 @@ cargo test
 cargo clippy --all-targets -- -D warnings
 ```
 
-GNSS設定応答専用firmwareは次で型検査できますが、実機実行はhardware復旧後に行います。
+GNSS設定応答、E220 readback、microSD read-only確認用firmwareは次で型検査できます。Mission Board用firmwareではないため、ComBoard以外へflashしないでください。
 
 ```sh
 cargo check --test gnss_setting_response --features hardware-test \
+  --target xtensa-esp32s3-none-elf -Z build-std=core
+cargo check --test e220_readback --features hardware-test \
+  --target xtensa-esp32s3-none-elf -Z build-std=core
+cargo check --test sd_log_verify --features hardware-test \
   --target xtensa-esp32s3-none-elf -Z build-std=core
 ```
 
 ## Known limitations
 
-- ComBoard側の問題により、今回のflash/boot、Mission↔Com CAN、Com↔Ground LoRa、GNSS receiver ACK/fix/stale、SD書込みの実機検証は未実施です。
+- microSDは同一実機で初期化成功後、後続試験では`TimeoutCommand(41)`が継続しました。loggingと`CAN.CSV`実データ確認はBLOCKEDで、card/hardware/初期化条件の切り分けが残っています。
 - GNSS設定は各UBX commandのACK/NAKを検証しますが、最後のbaud変更commandはbaud切替を伴うためACK未確認です。
 - GGAから位置/fixを取得します。NMEA日付をUnix時刻へ変換するperiodic GNSS `TimeSync`は未実装で、MissionのTimeRequestはB1とGroundTimeResponse uplinkの経路を使用します。
 - A0/A6/B0/B1 layout、A0 status割当、local command code、freshness、Recovery rateはVaultの実装仮定台帳に記録した暫定値です。
 - A6はRAM上の16-byte queueへspoolします。通信基板microSDへの全Recovery dump spoolと自動resume requestは未実装です。
-- 実機の100 Hz CAN負荷、Emergency end-to-end latency、E220 packet loss、GNSS屋外fixはhardware復旧後に測定が必要です。
+- GNSS receiver/configurationと屋内NO_FIX/OFF stale-clearは実機確認済みです。屋外fixは未評価です。
+- 3基板でCAN 100 Hz系とLoRa 130秒連続通信を確認済みです。長時間・離距離・RF干渉・電源変動を含む耐久試験は別途必要です。
+- Emergency resultはgeneric transaction trackerに登録せず安全優先CAN queueで送ります。F0/F1はCAN ownerをblockしない専用priority LoRa queueへ送り、正常resultは実機PASS、CAN TX失敗時の`Failed/Timeout` B0はbuild/test PASSです。Mission非接続の実機失敗経路は未評価です。

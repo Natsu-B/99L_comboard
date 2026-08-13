@@ -17,6 +17,18 @@ path = "./test/gnss_setting_response.rs"
 harness = false
 required-features = ["hardware-test"]
 
+[[test]]
+name = "sd_log_verify"
+path = "./test/sd_log_verify.rs"
+harness = false
+required-features = ["hardware-test"]
+
+[[test]]
+name = "e220_readback"
+path = "./test/e220_readback.rs"
+harness = false
+required-features = ["hardware-test"]
+
 [features]
 default = []
 firmware = []
