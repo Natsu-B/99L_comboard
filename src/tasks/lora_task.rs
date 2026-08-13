@@ -186,9 +186,7 @@ async fn periodic_packet() -> Option<(LoraFrame, u16, u32)> {
 
     if !RECOVERY_BEACON_ACTIVE.load(Ordering::Relaxed)
         && state == MissionState::Descent
-        && cache.mission_event.value().is_some_and(|event| {
-            event.state == MissionState::Descent && event.elapsed < 0xfff0 && event.elapsed >= 1_200
-        })
+        && power.is_some_and(|value| recovery_elapsed_reached(value.descent_elapsed))
     {
         RECOVERY_BEACON_ACTIVE.store(true, Ordering::Relaxed);
     }
@@ -389,6 +387,10 @@ const fn periodic_interval_ms(recovery_active: bool) -> u64 {
     } else {
         LORA_TRANSMIT_INTERVAL_MS
     }
+}
+
+const fn recovery_elapsed_reached(descent_elapsed: u16) -> bool {
+    descent_elapsed >= 1_200 && descent_elapsed < 0xfff0
 }
 
 const RECOVERY_LOG_INTERVAL_MS: u64 = 200;
@@ -749,5 +751,14 @@ mod tests {
         SD_HAS_ERROR.store(false, Ordering::Relaxed);
         IS_CAN_ERROR.store(false, Ordering::Relaxed);
         assert_eq!(inject_link_health(1, 7, 8), 0x0181);
+    }
+
+    #[test]
+    fn recovery_transition_uses_valid_120_second_elapsed() {
+        assert!(!recovery_elapsed_reached(1_199));
+        assert!(recovery_elapsed_reached(1_200));
+        assert!(recovery_elapsed_reached(0xffef));
+        assert!(!recovery_elapsed_reached(0xfff0));
+        assert!(!recovery_elapsed_reached(0xffff));
     }
 }
