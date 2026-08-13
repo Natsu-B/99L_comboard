@@ -80,22 +80,60 @@ fn parse_utc_time(bytes: &[u8]) -> Result<UtcTime, GgaParseError> {
         return Err(GgaParseError::ParseError);
     }
 
-    Ok(UtcTime {
+    let value = UtcTime {
         hour: parse_num::<u8>(&bytes[0..2])?,
         minute: parse_num::<u8>(&bytes[2..4])?,
         second: parse_num::<f32>(&bytes[4..])?,
-    })
+    };
+    if value.hour >= 24 || value.minute >= 60 || !(0.0..60.0).contains(&value.second) {
+        return Err(GgaParseError::ParseError);
+    }
+    Ok(value)
 }
 
 fn nmea_to_decimal(nmea_val: f64, hemisphere: u8) -> Result<f64, GgaParseError> {
     let degrees = (nmea_val / 100.0) as i32 as f64;
     let minutes = nmea_val - degrees * 100.0;
+    let maximum_degrees = if matches!(hemisphere, b'N' | b'S') {
+        90.0
+    } else if matches!(hemisphere, b'E' | b'W') {
+        180.0
+    } else {
+        return Err(GgaParseError::InvalidHemisphere);
+    };
+    if nmea_val < 0.0
+        || !(0.0..60.0).contains(&minutes)
+        || degrees > maximum_degrees
+        || (degrees == maximum_degrees && minutes != 0.0)
+    {
+        return Err(GgaParseError::ParseError);
+    }
     let decimal = degrees + minutes / 60.0;
 
     match hemisphere {
         b'N' | b'E' => Ok(decimal),
         b'S' | b'W' => Ok(-decimal),
         _ => Err(GgaParseError::InvalidHemisphere),
+    }
+}
+
+#[cfg(test)]
+mod validation_tests {
+    use super::*;
+
+    #[test]
+    fn utc_ranges_are_validated() {
+        assert!(parse_utc_time(b"235959.9").is_ok());
+        assert!(parse_utc_time(b"240000").is_err());
+        assert!(parse_utc_time(b"126000").is_err());
+    }
+
+    #[test]
+    fn coordinate_minutes_and_degrees_are_validated() {
+        assert!(nmea_to_decimal(4_059.999, b'N').is_ok());
+        assert!(nmea_to_decimal(4_060.0, b'N').is_err());
+        assert!(nmea_to_decimal(9_001.0, b'N').is_err());
+        assert!(nmea_to_decimal(18_001.0, b'E').is_err());
     }
 }
 

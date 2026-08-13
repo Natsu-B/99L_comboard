@@ -28,7 +28,17 @@ use crate::{
 const GNSS_STALE_TIMEOUT_MS: u64 = 3_000;
 
 async fn set_receiver_state(state: GnssReceiverState) {
-    GNSS_TELEMETRY.lock().await.state = state;
+    let mut telemetry = GNSS_TELEMETRY.lock().await;
+    telemetry.state = state;
+    if state == GnssReceiverState::Starting {
+        telemetry.started_at_ms = Some(Instant::now().as_millis());
+    }
+    if state == GnssReceiverState::ConfigurationFailed || state == GnssReceiverState::ReceiverError
+    {
+        telemetry.east = GNSS_COORDINATE_RECEIVER_ERROR;
+        telemetry.north = GNSS_COORDINATE_RECEIVER_ERROR;
+        telemetry.height = GNSS_HEIGHT_RECEIVER_ERROR;
+    }
 }
 
 #[embassy_executor::task]
@@ -62,7 +72,10 @@ pub async fn gnss_manager_task(mut uart: Uart<'static, Async>, mut gnss_en: Outp
                             {
                                 let mut telemetry = GNSS_TELEMETRY.lock().await;
                                 telemetry.last_receiver_at_ms = Some(now_ms);
-                                if !matches!(telemetry.state, GnssReceiverState::ValidFix) {
+                                if matches!(
+                                    telemetry.state,
+                                    GnssReceiverState::Starting | GnssReceiverState::ReceiverError
+                                ) {
                                     telemetry.state = GnssReceiverState::ReceiverDetected;
                                 }
                             }
@@ -103,12 +116,18 @@ pub async fn gnss_manager_task(mut uart: Uart<'static, Async>, mut gnss_en: Outp
                         continue;
                     }
                     Timer::after(Duration::from_millis(500)).await;
-                    if let Err(error) = gnss_setting(&mut uart).await {
-                        GNSS_SETTING_ERROR_COUNT.fetch_add(1, Ordering::Relaxed);
-                        println!("GNSS setting failed: {:?}", error);
-                        set_receiver_state(GnssReceiverState::ConfigurationFailed).await;
-                        gnss_en.set_low();
-                        continue;
+                    match gnss_setting(&mut uart).await {
+                        Ok(report) => println!(
+                            "GNSS configuration ACK count={}, final baud ACK unverified={}",
+                            report.acknowledged_commands, report.final_baud_ack_unverified
+                        ),
+                        Err(error) => {
+                            GNSS_SETTING_ERROR_COUNT.fetch_add(1, Ordering::Relaxed);
+                            println!("GNSS setting failed: {:?}", error);
+                            set_receiver_state(GnssReceiverState::ConfigurationFailed).await;
+                            gnss_en.set_low();
+                            continue;
+                        }
                     }
                     Timer::after(Duration::from_millis(50)).await;
                     if uart
@@ -190,13 +209,26 @@ pub async fn parse_gnss_task() {
                 let mut telemetry = GNSS_TELEMETRY.lock().await;
                 match telemetry.state {
                     GnssReceiverState::Starting
-                        if telemetry.last_receiver_at_ms.is_none_or(|seen| {
+                        if telemetry.started_at_ms.is_none_or(|seen| {
                             now_ms.saturating_sub(seen) >= GNSS_STALE_TIMEOUT_MS
                         }) =>
                     {
+                        telemetry.state = GnssReceiverState::ReceiverError;
                         telemetry.east = GNSS_COORDINATE_RECEIVER_ERROR;
                         telemetry.north = GNSS_COORDINATE_RECEIVER_ERROR;
                         telemetry.height = GNSS_HEIGHT_RECEIVER_ERROR;
+                    }
+                    GnssReceiverState::ReceiverDetected
+                    | GnssReceiverState::NoFix
+                    | GnssReceiverState::InvalidSample
+                        if telemetry.last_receiver_at_ms.is_some_and(|seen| {
+                            now_ms.saturating_sub(seen) >= GNSS_STALE_TIMEOUT_MS
+                        }) =>
+                    {
+                        telemetry.state = GnssReceiverState::Stale;
+                        telemetry.east = GNSS_COORDINATE_STALE;
+                        telemetry.north = GNSS_COORDINATE_STALE;
+                        telemetry.height = GNSS_HEIGHT_STALE;
                     }
                     GnssReceiverState::ValidFix
                         if telemetry.last_fix_at_ms.is_some_and(|fix| {

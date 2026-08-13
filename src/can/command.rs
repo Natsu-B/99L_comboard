@@ -47,7 +47,13 @@ impl TransactionTracker {
             .find(|entry| entry.request.transaction_id == request.transaction_id)
         {
             return if entry.request == request {
-                RegisterResult::DuplicatePending
+                self.results
+                    .iter()
+                    .flatten()
+                    .find(|cached| cached.request == request)
+                    .map_or(RegisterResult::DuplicatePending, |cached| {
+                        RegisterResult::Replay(cached.result)
+                    })
             } else {
                 RegisterResult::ProtocolError
             };
@@ -96,16 +102,6 @@ impl TransactionTracker {
             self.pending[index] = None;
         }
         true
-    }
-
-    pub fn cancel_before_transmit(&mut self, request: GenericCommandRequest) {
-        if let Some(index) = self
-            .pending
-            .iter()
-            .position(|entry| entry.is_some_and(|entry| entry.request == request))
-        {
-            self.pending[index] = None;
-        }
     }
 
     pub fn pending_count(&self) -> usize {
@@ -168,6 +164,10 @@ mod tests {
         tracker.register(request);
         assert!(tracker.apply_result(result(request, CommandPhase::Accepted)));
         assert_eq!(tracker.pending_count(), 1);
+        assert_eq!(
+            tracker.register(request),
+            RegisterResult::Replay(result(request, CommandPhase::Accepted))
+        );
         let final_result = result(request, CommandPhase::Completed);
         assert!(tracker.apply_result(final_result));
         assert_eq!(tracker.pending_count(), 0);
@@ -203,5 +203,21 @@ mod tests {
                 RegisterResult::Replay(_)
             ));
         }
+    }
+
+    #[test]
+    fn transmit_failure_is_cached_instead_of_reusing_the_id() {
+        let mut tracker = TransactionTracker::new();
+        let request = request(1, 2);
+        assert_eq!(tracker.register(request), RegisterResult::Forward);
+        let failed = CommandResult {
+            transaction_id: 1,
+            command: 2,
+            phase: CommandPhase::Failed,
+            reason: CommandReason::Timeout,
+            detail: 0,
+        };
+        assert!(tracker.apply_result(failed));
+        assert_eq!(tracker.register(request), RegisterResult::Replay(failed));
     }
 }

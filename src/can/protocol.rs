@@ -693,26 +693,120 @@ mod tests {
 
     #[test]
     fn canonical_can_rx_vectors_decode() {
-        for (name, id) in [
-            ("CAN_011", CAN_ID_COMMAND_RESULT),
-            ("CAN_012", CAN_ID_TIME_REQUEST),
-            ("CAN_020", CAN_ID_MISSION_EVENT),
-            ("CAN_100", CAN_ID_KINEMATICS),
-            ("CAN_101", CAN_ID_CONTROL),
-            ("CAN_102", CAN_ID_MISSION_STATUS),
-            ("CAN_103", CAN_ID_POWER_TIME),
-            ("CAN_104", CAN_ID_DESCENT_CORE),
-            ("CAN_105", CAN_ID_RECOVERY_STATUS),
-            ("CAN_106", CAN_ID_RECOVERY_LOG_DATA),
-            ("CAN_107", CAN_ID_ATTITUDE_TILT),
-            ("CAN_108", CAN_ID_LPS),
-            ("CAN_109", CAN_ID_AIRSPEED),
-        ] {
-            assert!(
-                CanRxMessage::decode_standard(id, &golden(name)).is_ok(),
-                "{name}"
-            );
-        }
+        assert_eq!(
+            CanRxMessage::decode_standard(CAN_ID_COMMAND_RESULT, &golden("CAN_011")),
+            Ok(CanRxMessage::CommandResult(CommandResult {
+                transaction_id: 0x2a,
+                command: 0x13,
+                phase: CommandPhase::Failed,
+                reason: CommandReason::InterruptedByEmergency,
+                detail: 0x1234_5678,
+            }))
+        );
+        assert_eq!(
+            CanRxMessage::decode_standard(CAN_ID_TIME_REQUEST, &golden("CAN_012")),
+            Ok(CanRxMessage::TimeRequest { request_id: 7 })
+        );
+        assert_eq!(
+            CanRxMessage::decode_standard(CAN_ID_MISSION_EVENT, &golden("CAN_020")),
+            Ok(CanRxMessage::MissionEvent(MissionEvent {
+                sequence: 0xff,
+                flags: 0x4061,
+                state: MissionState::Control,
+                elapsed: 1234,
+                detail: 0xbeef,
+            }))
+        );
+        assert_eq!(
+            CanRxMessage::decode_standard(CAN_ID_KINEMATICS, &golden("CAN_100")),
+            Ok(CanRxMessage::Kinematics(KinematicsTelemetry {
+                sequence: 0xff,
+                roll: 0x800d,
+                roll_rate: 0xfff6,
+                fin_angle: 0xfe,
+                fin_rate: 0x8009,
+            }))
+        );
+        assert_eq!(
+            CanRxMessage::decode_standard(CAN_ID_CONTROL, &golden("CAN_101")),
+            Ok(CanRxMessage::Control(ControlTelemetry {
+                sequence: 0xfe,
+                requested_torque: 0x0f85,
+                elapsed: 0x7b,
+            }))
+        );
+        assert_eq!(
+            CanRxMessage::decode_standard(CAN_ID_MISSION_STATUS, &golden("CAN_102")),
+            Ok(CanRxMessage::MissionStatus(MissionStatusTelemetry {
+                sequence: 0xfd,
+                state: MissionState::Control,
+                status: 0xa55a,
+                config: 0x6d,
+                fin_mode: FinMode::RollControl,
+                para_mode: ParaMode::Hold,
+                para_angle: 0x78,
+            }))
+        );
+        assert_eq!(
+            CanRxMessage::decode_standard(CAN_ID_POWER_TIME, &golden("CAN_103")),
+            Ok(CanRxMessage::PowerTime(PowerTimeTelemetry {
+                sequence: 0xfc,
+                logic_voltage: 0xa0,
+                motor_voltage: 0xdc,
+                descent_elapsed: 0xfffa,
+                recovery_elapsed: 0x000c,
+                flags: 0x65,
+            }))
+        );
+        assert_eq!(
+            CanRxMessage::decode_standard(CAN_ID_DESCENT_CORE, &golden("CAN_104")),
+            Ok(CanRxMessage::DescentCore(DescentCoreTelemetry {
+                sequence: 0xfb,
+                status: 0x1a55,
+                para_angle: 0xf7,
+            }))
+        );
+        assert_eq!(
+            CanRxMessage::decode_standard(CAN_ID_RECOVERY_STATUS, &golden("CAN_105")),
+            Ok(CanRxMessage::RecoveryStatus(RecoveryStatus {
+                opcode: RecoveryOpcode::StartLogDump,
+                transfer_id: 0x34,
+                status: RecoveryStatusCode::Dumping,
+                source: RecoverySource::MissionSdLatestFlight,
+                total_size: 100_000,
+            }))
+        );
+        assert_eq!(
+            CanRxMessage::decode_standard(CAN_ID_RECOVERY_LOG_DATA, &golden("CAN_106")),
+            Ok(CanRxMessage::RecoveryLogData(RecoveryLogData {
+                transfer_id: 0x34,
+                sequence: 0xff,
+                data: [0xde, 0xad, 0xbe, 0xef, 0x00, 0x11],
+            }))
+        );
+        assert_eq!(
+            CanRxMessage::decode_standard(CAN_ID_ATTITUDE_TILT, &golden("CAN_107")),
+            Ok(CanRxMessage::AttitudeTilt(AttitudeTiltTelemetry {
+                sequence: 0xfa,
+                magnitude: 20,
+                direction: 280,
+            }))
+        );
+        assert_eq!(
+            CanRxMessage::decode_standard(CAN_ID_LPS, &golden("CAN_108")),
+            Ok(CanRxMessage::Lps(LpsTelemetry {
+                sequence: 0xf9,
+                pressure: 0x042a,
+                temperature: 0x46,
+            }))
+        );
+        assert_eq!(
+            CanRxMessage::decode_standard(CAN_ID_AIRSPEED, &golden("CAN_109")),
+            Ok(CanRxMessage::Airspeed(AirspeedTelemetry {
+                sequence: 0xf8,
+                airspeed: 0x3d,
+            }))
+        );
     }
 
     #[test]

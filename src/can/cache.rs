@@ -91,7 +91,9 @@ pub struct CanCache {
     pub recovery_log_data: Latest<RecoveryLogData>,
     pub command_result: Latest<CommandResult>,
     pub time_request: Latest<u8>,
+    pub mission_event: Latest<MissionEvent>,
     event_flags_latched: u16,
+    event_revision: u32,
     last_event_sequence: Option<u8>,
 }
 
@@ -110,7 +112,9 @@ impl CanCache {
             recovery_log_data: Latest::new(),
             command_result: Latest::new(),
             time_request: Latest::new(),
+            mission_event: Latest::new(),
             event_flags_latched: 0,
+            event_revision: 0,
             last_event_sequence: None,
         }
     }
@@ -131,7 +135,9 @@ impl CanCache {
                 }
                 let new_flags = event.flags & !self.event_flags_latched;
                 self.event_flags_latched |= event.flags;
+                self.event_revision = self.event_revision.wrapping_add(1);
                 self.last_event_sequence = Some(event.sequence);
+                self.mission_event.update(event, received_at_ms);
                 CacheUpdate::MissionEvent { event, new_flags }
             }
             CanRxMessage::Kinematics(value) => {
@@ -181,8 +187,14 @@ impl CanCache {
         self.event_flags_latched
     }
 
-    pub fn clear_event_flags(&mut self, flags: u16) {
-        self.event_flags_latched &= !flags;
+    pub const fn event_snapshot(&self) -> (u16, u32) {
+        (self.event_flags_latched, self.event_revision)
+    }
+
+    pub fn clear_event_flags(&mut self, flags: u16, revision: u32) {
+        if self.event_revision == revision {
+            self.event_flags_latched &= !flags;
+        }
     }
 }
 
@@ -273,7 +285,8 @@ mod tests {
             }
         );
         assert_eq!(cache.event_flags_latched(), 0x0007);
-        cache.clear_event_flags(0x0003);
+        let (_, revision) = cache.event_snapshot();
+        cache.clear_event_flags(0x0003, revision);
         assert_eq!(cache.event_flags_latched(), 0x0004);
     }
 
@@ -285,5 +298,15 @@ mod tests {
             cache.update(CanRxMessage::MissionEvent(event(0, 2)), 2),
             CacheUpdate::MissionEvent { .. }
         ));
+    }
+
+    #[test]
+    fn event_arriving_during_send_is_not_cleared() {
+        let mut cache = CanCache::new();
+        cache.update(CanRxMessage::MissionEvent(event(1, 1)), 0);
+        let (flags, revision) = cache.event_snapshot();
+        cache.update(CanRxMessage::MissionEvent(event(2, 1)), 1);
+        cache.clear_event_flags(flags, revision);
+        assert_eq!(cache.event_flags_latched(), 1);
     }
 }

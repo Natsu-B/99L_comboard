@@ -23,10 +23,12 @@ pub struct EncodedPosition {
 
 pub fn encode_position(latitude_e7: i32, longitude_e7: i32, height_m: f32) -> EncodedPosition {
     let north = round_to_i32(
-        f64::from(latitude_e7 - REFERENCE_LATITUDE_E7) * 111_039.303_376 / 10_000_000.0,
+        (f64::from(latitude_e7) - f64::from(REFERENCE_LATITUDE_E7)) * 111_039.303_376
+            / 10_000_000.0,
     );
     let east = round_to_i32(
-        f64::from(longitude_e7 - REFERENCE_LONGITUDE_E7) * 85_090.557_487 / 10_000_000.0,
+        (f64::from(longitude_e7) - f64::from(REFERENCE_LONGITUDE_E7)) * 85_090.557_487
+            / 10_000_000.0,
     );
     EncodedPosition {
         east: encode_coordinate(east),
@@ -54,6 +56,9 @@ fn encode_coordinate(value: i32) -> u16 {
 fn encode_height(value_m: f32) -> u16 {
     if !value_m.is_finite() {
         return GNSS_HEIGHT_INVALID;
+    }
+    if !(-100.0..=2_375.0).contains(&value_m) {
+        return GNSS_HEIGHT_OUT_OF_RANGE;
     }
     let raw = if value_m >= -100.0 {
         ((value_m + 100.0) / 5.0 + 0.5) as i32
@@ -99,5 +104,17 @@ mod tests {
     fn reserved_coordinate_region_is_never_numeric() {
         assert_eq!(encode_coordinate(-32_753), GNSS_COORDINATE_OUT_OF_RANGE);
         assert_eq!(encode_coordinate(-32_752), 0x8010);
+    }
+
+    #[test]
+    fn longitude_difference_does_not_overflow_i32() {
+        let position = encode_position(REFERENCE_LATITUDE_E7, -1_800_000_000, 0.0);
+        assert_eq!(position.east, GNSS_COORDINATE_OUT_OF_RANGE);
+    }
+
+    #[test]
+    fn height_checks_physical_boundary_before_rounding() {
+        assert_eq!(encode_height(-100.01), GNSS_HEIGHT_OUT_OF_RANGE);
+        assert_eq!(encode_height(2_375.01), GNSS_HEIGHT_OUT_OF_RANGE);
     }
 }

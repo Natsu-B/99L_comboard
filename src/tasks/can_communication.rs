@@ -13,17 +13,22 @@ use crate::{
     can::{
         cache::{CacheUpdate, FRESHNESS_10_HZ_MS},
         health::{CanHealth, classify_can_health},
-        protocol::CanRxMessage,
+        protocol::{
+            CanRxMessage, CanTxMessage, RecoveryControl, RecoveryOpcode, RecoverySource,
+            RecoveryStatusCode,
+        },
         tx::{CanTxError, transmit_message_with_timeout},
     },
     constants::{
         CAN_CONSECUTIVE_ERROR_THRESHOLD, CAN_HEALTH_MONITOR_INTERVAL_MS, CAN_TX_TIMEOUT_MS,
     },
-    payload::{ApplicationPacket, CommandResultPacket},
+    payload::{ApplicationPacket, CommandResultPacket, RecoveryLogPacket},
     state::{
-        CAN_CACHE, CAN_HEALTH, CAN_REC, CAN_RX_ERROR_COUNT, CAN_SAFETY_TX_SIGNAL, CAN_TEC,
-        CAN_TX_CHANNEL, CAN_TX_ERROR_COUNT, COMMAND_TRACKER, IMMEDIATE_LORA_CHANNEL, IS_CAN_ERROR,
-        RAW_CAN_LOG_CHANNEL, RAW_CAN_LOG_DROPPED_COUNT, RECOVERY_SESSION, RawCanRecord,
+        CAN_CACHE, CAN_HEALTH, CAN_REC, CAN_RX_ERROR_COUNT, CAN_SAFETY_TX_CHANNEL, CAN_TEC,
+        CAN_TX_CHANNEL, CAN_TX_ERROR_COUNT, COMMAND_TRACKER, GNSS_CMD_CHANNEL, GnssCommand,
+        IMMEDIATE_LORA_CHANNEL, IS_CAN_ERROR, LOGGING_REQUESTED, RAW_CAN_LOG_CHANNEL,
+        RAW_CAN_LOG_DROPPED_COUNT, RECOVERY_ASSEMBLER, RECOVERY_LORA_CHANNEL, RECOVERY_SESSION,
+        RawCanRecord,
     },
 };
 
@@ -105,12 +110,14 @@ fn publish_error_state(
     health: CanHealth,
     consecutive_tx_errors: u8,
     consecutive_rx_errors: u8,
+    mission_status_fresh: bool,
 ) {
     IS_CAN_ERROR.store(
         state != CanRuntimeState::Normal
             || health != CanHealth::Active
             || consecutive_tx_errors >= CAN_CONSECUTIVE_ERROR_THRESHOLD
-            || consecutive_rx_errors >= CAN_CONSECUTIVE_ERROR_THRESHOLD,
+            || consecutive_rx_errors >= CAN_CONSECUTIVE_ERROR_THRESHOLD
+            || !mission_status_fresh,
         Ordering::Relaxed,
     );
 }
@@ -123,6 +130,54 @@ async fn queue_application(packet: ApplicationPacket) {
             }
         }
         Err(error) => println!("LoRa packet encode error: {:?}", error),
+    }
+}
+
+async fn queue_recovery_chunk(chunk: crate::can::recovery::RecoveryChunk) -> bool {
+    let packet = ApplicationPacket::RecoveryLogData(RecoveryLogPacket {
+        transfer_id: chunk.transfer_id,
+        source: chunk.source == RecoverySource::MissionSdLatestFlight,
+        end_of_file: chunk.end_of_file,
+        offset: chunk.offset,
+        data_length: chunk.data_length,
+        data: chunk.data,
+    });
+    match packet.encode() {
+        Ok(frame) if RECOVERY_LORA_CHANNEL.try_send(frame).is_ok() => true,
+        Ok(_) => {
+            println!("Recovery LoRa queue overflow: transfer stopped");
+            false
+        }
+        Err(error) => {
+            println!("Recovery LoRa encode error: {:?}", error);
+            false
+        }
+    }
+}
+
+async fn fail_recovery_transfer(reason: crate::can::protocol::CommandReason, stop_mission: bool) {
+    let resume = RECOVERY_ASSEMBLER.lock().await.abort();
+    if stop_mission && let Some(resume) = resume {
+        let _ = CAN_TX_CHANNEL.try_send(crate::state::CanTxRequest {
+            message: CanTxMessage::RecoveryControl(RecoveryControl {
+                opcode: RecoveryOpcode::StopLogDump,
+                source: resume.source,
+                transfer_id: resume.transfer_id,
+                offset: resume.offset,
+                length: 0,
+            }),
+        });
+    }
+    let detail = resume.map_or(0, |value| value.offset);
+    if let Some(result) = RECOVERY_SESSION.lock().await.fail(reason, detail) {
+        queue_application(ApplicationPacket::CommandResult(CommandResultPacket {
+            transaction_id: result.transaction_id,
+            command: result.command,
+            phase: result.phase,
+            reason: result.reason,
+            detail: result.detail,
+        }))
+        .await;
     }
 }
 
@@ -153,6 +208,23 @@ async fn apply_received_message(message: CanRxMessage, received_at_ms: u64) {
         }
         CacheUpdate::DuplicateMissionEvent => {}
         CacheUpdate::RecoveryStatus(status) => {
+            RECOVERY_ASSEMBLER
+                .lock()
+                .await
+                .set_total_size(status.transfer_id, status.total_size);
+            if status.status == RecoveryStatusCode::Complete {
+                let final_chunk = { RECOVERY_ASSEMBLER.lock().await.finish(status.transfer_id) };
+                if let Some(chunk) = final_chunk {
+                    if !queue_recovery_chunk(chunk).await {
+                        fail_recovery_transfer(
+                            crate::can::protocol::CommandReason::InternalError,
+                            true,
+                        )
+                        .await;
+                        return;
+                    }
+                }
+            }
             if let Some(result) = RECOVERY_SESSION.lock().await.apply_status(status) {
                 queue_application(ApplicationPacket::CommandResult(CommandResultPacket {
                     transaction_id: result.transaction_id,
@@ -164,7 +236,29 @@ async fn apply_received_message(message: CanRxMessage, received_at_ms: u64) {
                 .await;
             }
         }
-        CacheUpdate::RecoveryLogData(_) | CacheUpdate::Telemetry => {}
+        CacheUpdate::RecoveryLogData(fragment) => {
+            let assembly = { RECOVERY_ASSEMBLER.lock().await.push(fragment) };
+            match assembly {
+                Ok(Some(chunk)) if !queue_recovery_chunk(chunk).await => {
+                    fail_recovery_transfer(
+                        crate::can::protocol::CommandReason::InternalError,
+                        true,
+                    )
+                    .await;
+                }
+                Ok(Some(_)) => {}
+                Ok(None) => {}
+                Err(error) => {
+                    println!("Recovery log assembly error: {:?}", error);
+                    fail_recovery_transfer(
+                        crate::can::protocol::CommandReason::ProtocolError,
+                        true,
+                    )
+                    .await;
+                }
+            }
+        }
+        CacheUpdate::Telemetry => {}
     }
 }
 
@@ -209,36 +303,102 @@ pub async fn can_communication_task(mut can: twai::Twai<'static, Async>) {
     loop {
         match select3(
             health_ticker.next(),
-            select(CAN_SAFETY_TX_SIGNAL.wait(), CAN_TX_CHANNEL.receive()),
+            select(CAN_SAFETY_TX_CHANNEL.receive(), CAN_TX_CHANNEL.receive()),
             can.receive_async(),
         )
         .await
         {
             Either3::Second(request) => {
-                let request = match request {
+                let mut request = match request {
                     Either::First(request) | Either::Second(request) => request,
                 };
-                match transmit_message_with_timeout(&mut can, request.message, tx_timeout).await {
-                    Ok(()) => {
-                        consecutive_tx_errors = 0;
-                        runtime_state =
-                            transition_runtime(runtime_state, CanRuntimeEvent::TransmitSucceeded).0;
-                    }
-                    Err(error) => {
-                        CAN_TX_ERROR_COUNT.fetch_add(1, Ordering::Relaxed);
-                        consecutive_tx_errors = consecutive_tx_errors.saturating_add(1);
-                        println!("CAN transmit error: {:?}", error);
-                        if matches!(error, CanTxError::BusOff | CanTxError::TimedOutUnknownState) {
-                            let event = if error == CanTxError::BusOff {
-                                CanRuntimeEvent::BusOff
-                            } else {
-                                CanRuntimeEvent::TimedOutUnknownState
-                            };
-                            let recovery = enter_recovering(can, runtime_state, event);
-                            can = recovery.0;
-                            runtime_state = recovery.1;
+                loop {
+                    match transmit_message_with_timeout(&mut can, request.message, tx_timeout).await
+                    {
+                        Ok(()) => {
+                            consecutive_tx_errors = 0;
+                            runtime_state = transition_runtime(
+                                runtime_state,
+                                CanRuntimeEvent::TransmitSucceeded,
+                            )
+                            .0;
+                            if let CanTxMessage::GenericCommandRequest(generic) = request.message
+                                && generic.command == 0x01
+                            {
+                                LOGGING_REQUESTED.store(true, Ordering::Relaxed);
+                                let _ = GNSS_CMD_CHANNEL.try_send(GnssCommand::TurnOn);
+                            }
+                        }
+                        Err(error) => {
+                            CAN_TX_ERROR_COUNT.fetch_add(1, Ordering::Relaxed);
+                            consecutive_tx_errors = consecutive_tx_errors.saturating_add(1);
+                            println!("CAN transmit error: {:?}", error);
+                            match request.message {
+                                crate::can::protocol::CanTxMessage::GenericCommandRequest(
+                                    generic,
+                                ) => {
+                                    let result = crate::can::protocol::CommandResult {
+                                        transaction_id: generic.transaction_id,
+                                        command: generic.command,
+                                        phase: crate::can::protocol::CommandPhase::Failed,
+                                        reason: crate::can::protocol::CommandReason::Timeout,
+                                        detail: 0,
+                                    };
+                                    if COMMAND_TRACKER.lock().await.apply_result(result) {
+                                        queue_application(ApplicationPacket::CommandResult(
+                                            CommandResultPacket {
+                                                transaction_id: result.transaction_id,
+                                                command: result.command,
+                                                phase: result.phase,
+                                                reason: result.reason,
+                                                detail: result.detail,
+                                            },
+                                        ))
+                                        .await;
+                                    }
+                                }
+                                crate::can::protocol::CanTxMessage::RecoveryControl(control) => {
+                                    if let Some(result) =
+                                        RECOVERY_SESSION.lock().await.fail_matching(
+                                            control.transfer_id,
+                                            crate::can::protocol::CommandReason::Timeout,
+                                            0,
+                                        )
+                                    {
+                                        let _ = RECOVERY_ASSEMBLER.lock().await.abort();
+                                        queue_application(ApplicationPacket::CommandResult(
+                                            CommandResultPacket {
+                                                transaction_id: result.transaction_id,
+                                                command: result.command,
+                                                phase: result.phase,
+                                                reason: result.reason,
+                                                detail: result.detail,
+                                            },
+                                        ))
+                                        .await;
+                                    }
+                                }
+                                _ => {}
+                            }
+                            if matches!(
+                                error,
+                                CanTxError::BusOff | CanTxError::TimedOutUnknownState
+                            ) {
+                                let event = if error == CanTxError::BusOff {
+                                    CanRuntimeEvent::BusOff
+                                } else {
+                                    CanRuntimeEvent::TimedOutUnknownState
+                                };
+                                let recovery = enter_recovering(can, runtime_state, event);
+                                can = recovery.0;
+                                runtime_state = recovery.1;
+                            }
                         }
                     }
+                    let Ok(next_safety) = CAN_SAFETY_TX_CHANNEL.try_receive() else {
+                        break;
+                    };
+                    request = next_safety;
                 }
             }
             Either3::Third(result) => match result {
@@ -267,24 +427,21 @@ pub async fn can_communication_task(mut can: twai::Twai<'static, Async>) {
                     can = recovery.0;
                     runtime_state = recovery.1;
                 }
-                let now_ms = Instant::now().as_millis();
-                if CAN_CACHE
-                    .lock()
-                    .await
-                    .mission_status
-                    .freshness(now_ms, FRESHNESS_10_HZ_MS)
-                    != crate::can::cache::Freshness::Fresh
-                {
-                    IS_CAN_ERROR.store(true, Ordering::Relaxed);
-                }
             }
         }
         let health = publish_health(&can);
+        let mission_status_fresh = CAN_CACHE
+            .lock()
+            .await
+            .mission_status
+            .freshness(Instant::now().as_millis(), FRESHNESS_10_HZ_MS)
+            == crate::can::cache::Freshness::Fresh;
         publish_error_state(
             runtime_state,
             health,
             consecutive_tx_errors,
             consecutive_rx_errors,
+            mission_status_fresh,
         );
     }
 }

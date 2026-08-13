@@ -6,8 +6,10 @@ use embassy_sync::{
 
 use crate::{
     can::{
-        cache::CanCache, command::TransactionTracker, protocol::CanTxMessage,
-        recovery::RecoverySession,
+        cache::CanCache,
+        command::TransactionTracker,
+        protocol::CanTxMessage,
+        recovery::{RecoveryAssembler, RecoverySession},
     },
     lora_uplink::UplinkCommand,
     payload::LoraFrame,
@@ -27,6 +29,7 @@ pub enum GnssReceiverState {
     Starting,
     ReceiverDetected,
     ConfigurationFailed,
+    ReceiverError,
     NoFix,
     ValidFix,
     InvalidSample,
@@ -41,6 +44,7 @@ pub struct GnssTelemetry {
     pub height: u16,
     pub last_receiver_at_ms: Option<u64>,
     pub last_fix_at_ms: Option<u64>,
+    pub started_at_ms: Option<u64>,
 }
 
 impl GnssTelemetry {
@@ -52,6 +56,7 @@ impl GnssTelemetry {
             height: 496,
             last_receiver_at_ms: None,
             last_fix_at_ms: None,
+            started_at_ms: None,
         }
     }
 }
@@ -80,6 +85,8 @@ pub static COMMAND_TRACKER: Mutex<CriticalSectionRawMutex, TransactionTracker> =
     Mutex::new(TransactionTracker::new());
 pub static RECOVERY_SESSION: Mutex<CriticalSectionRawMutex, RecoverySession> =
     Mutex::new(RecoverySession::new());
+pub static RECOVERY_ASSEMBLER: Mutex<CriticalSectionRawMutex, RecoveryAssembler> =
+    Mutex::new(RecoveryAssembler::new());
 pub static RECOVERY_BEACON_ACTIVE: AtomicBool = AtomicBool::new(false);
 pub static RECOVERY_ENTER_SENT: AtomicBool = AtomicBool::new(false);
 pub static GNSS_TELEMETRY: Mutex<CriticalSectionRawMutex, GnssTelemetry> =
@@ -89,9 +96,11 @@ pub static GNSS_CMD_CHANNEL: Channel<CriticalSectionRawMutex, GnssCommand, 2> = 
 pub static UPLINK_COMMAND_CHANNEL: Channel<CriticalSectionRawMutex, UplinkCommand, 8> =
     Channel::new();
 pub static IMMEDIATE_LORA_CHANNEL: Channel<CriticalSectionRawMutex, LoraFrame, 8> = Channel::new();
+pub static RECOVERY_LORA_CHANNEL: Channel<CriticalSectionRawMutex, LoraFrame, 16> = Channel::new();
 pub static RAW_CAN_LOG_CHANNEL: Channel<CriticalSectionRawMutex, RawCanRecord, 32> = Channel::new();
 pub static CAN_TX_CHANNEL: Channel<CriticalSectionRawMutex, CanTxRequest, 8> = Channel::new();
-pub static CAN_SAFETY_TX_SIGNAL: Signal<CriticalSectionRawMutex, CanTxRequest> = Signal::new();
+pub static CAN_SAFETY_TX_CHANNEL: Channel<CriticalSectionRawMutex, CanTxRequest, 8> =
+    Channel::new();
 pub static LOGGING_REQUESTED: AtomicBool = AtomicBool::new(false);
 pub static LOGGING_ACTIVE: AtomicBool = AtomicBool::new(false);
 pub static SD_HAS_ERROR: AtomicBool = AtomicBool::new(false);
