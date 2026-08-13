@@ -1,6 +1,5 @@
 #![no_std]
 #![no_main]
-#![allow(dead_code)]
 
 #[path = "../src/gnss/settings.rs"]
 mod settings;

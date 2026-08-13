@@ -7,6 +7,9 @@ version      = "0.1.0"
 [[bin]]
 name = "c99l_comboard"
 path = "./src/bin/main.rs"
+required-features = ["firmware"]
+test = false
+bench = false
 
 [[test]]
 name = "gnss_setting_response"
@@ -16,10 +19,11 @@ required-features = ["hardware-test"]
 
 [features]
 default = []
-hardware-test = []
+firmware = []
+hardware-test = ["firmware"]
 lora-timing-debug = []
 
-[dependencies]
+[target.'cfg(target_arch = "xtensa")'.dependencies]
 esp-hal = { version = "1.1.1", features = ["esp32s3", "unstable","log-04"] }
 
 esp-rtos = { version = "0.3.0", features = ["embassy", "esp32s3","log-04"] }
