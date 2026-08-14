@@ -23,14 +23,19 @@ use crate::{
     constants::{
         CAN_CONSECUTIVE_ERROR_THRESHOLD, CAN_HEALTH_MONITOR_INTERVAL_MS, CAN_TX_TIMEOUT_MS,
     },
+    lora_scheduler::{
+        GroundTimeQueueAction, LoRaTxEnvelope, LoRaTxSource, ground_time_queue_action,
+    },
     payload::{ApplicationPacket, CommandResultPacket, RecoveryLogPacket},
     state::{
         CAN_CACHE, CAN_HEALTH, CAN_REC, CAN_RX_ERROR_COUNT, CAN_RX_SUCCESS_COUNT,
         CAN_SAFETY_TX_CHANNEL, CAN_TEC, CAN_TX_CHANNEL, CAN_TX_ERROR_COUNT, CAN_TX_SUCCESS_COUNT,
-        COMMAND_TRACKER, EMERGENCY_RESULT_LORA_CHANNEL, GNSS_CMD_CHANNEL, GnssCommand,
-        IMMEDIATE_LORA_CHANNEL, IS_CAN_ERROR, LOGGING_REQUESTED, LORA_TX_QUEUE_DROP_COUNT,
-        RAW_CAN_LOG_CHANNEL, RAW_CAN_LOG_DROPPED_COUNT, RECOVERY_ASSEMBLER, RECOVERY_LORA_CHANNEL,
-        RECOVERY_SESSION, RawCanRecord,
+        COMMAND_RESULT_LORA_CHANNEL, COMMAND_TRACKER, EMERGENCY_RESULT_LORA_CHANNEL,
+        GNSS_CMD_CHANNEL, GROUND_TIME_REQUEST_LORA_CHANNEL, GnssCommand, IS_CAN_ERROR,
+        LOGGING_REQUESTED, LORA_EMERGENCY_RESULT_DROP_COUNT, LORA_GROUND_TIME_REQUEST_DROP_COUNT,
+        LORA_GROUND_TIME_REQUEST_DUPLICATE_COUNT, LORA_TX_QUEUE_DROP_COUNT, RAW_CAN_LOG_CHANNEL,
+        RAW_CAN_LOG_DROPPED_COUNT, RECOVERY_ASSEMBLER, RECOVERY_LORA_CHANNEL, RECOVERY_SESSION,
+        RawCanRecord,
     },
 };
 
@@ -187,16 +192,56 @@ fn publish_error_state(
     );
 }
 
-async fn queue_application(packet: ApplicationPacket) {
-    match packet.encode() {
-        Ok(frame) => {
-            if IMMEDIATE_LORA_CHANNEL.try_send(frame).is_err() {
-                LORA_TX_QUEUE_DROP_COUNT.fetch_add(1, Ordering::Relaxed);
-                println!("即時LoRa packet queue overflow");
-            }
-        }
-        Err(error) => println!("LoRa packet encode error: {:?}", error),
+fn queue_command_result(packet: CommandResultPacket) {
+    let Ok(frame) = ApplicationPacket::CommandResult(packet).encode() else {
+        println!("CommandResult encode error");
+        return;
+    };
+    let envelope = LoRaTxEnvelope::queued(
+        frame,
+        LoRaTxSource::CommandResult,
+        Instant::now().as_micros(),
+    );
+    if COMMAND_RESULT_LORA_CHANNEL.try_send(envelope).is_err() {
+        LORA_TX_QUEUE_DROP_COUNT.fetch_add(1, Ordering::Relaxed);
+        println!("CommandResult LoRa queue overflow");
     }
+}
+
+fn queue_ground_time_request(request_id: u8, previous_request_id: &mut Option<u8>) {
+    let action = ground_time_queue_action(
+        *previous_request_id,
+        request_id,
+        GROUND_TIME_REQUEST_LORA_CHANNEL.is_full(),
+    );
+    if action == GroundTimeQueueAction::IgnoreDuplicate {
+        LORA_GROUND_TIME_REQUEST_DUPLICATE_COUNT.fetch_add(1, Ordering::Relaxed);
+        return;
+    }
+    let Ok(frame) = ApplicationPacket::GroundTimeRequest { request_id }.encode() else {
+        println!("GroundTimeRequest encode error");
+        return;
+    };
+    // この区間は単一CAN owner上でawaitしないため、oldest削除と再投入の間にtask切替しない。
+    if action == GroundTimeQueueAction::ReplaceOldest
+        && GROUND_TIME_REQUEST_LORA_CHANNEL.try_receive().is_ok()
+    {
+        LORA_TX_QUEUE_DROP_COUNT.fetch_add(1, Ordering::Relaxed);
+        LORA_GROUND_TIME_REQUEST_DROP_COUNT.fetch_add(1, Ordering::Relaxed);
+        println!("GroundTimeRequest LoRa queue full: oldest dropped");
+    }
+    let envelope = LoRaTxEnvelope::queued(
+        frame,
+        LoRaTxSource::GroundTimeRequest,
+        Instant::now().as_micros(),
+    );
+    if GROUND_TIME_REQUEST_LORA_CHANNEL.try_send(envelope).is_err() {
+        LORA_TX_QUEUE_DROP_COUNT.fetch_add(1, Ordering::Relaxed);
+        LORA_GROUND_TIME_REQUEST_DROP_COUNT.fetch_add(1, Ordering::Relaxed);
+        println!("GroundTimeRequest LoRa queue overflow: newest dropped");
+        return;
+    }
+    *previous_request_id = Some(request_id);
 }
 
 fn queue_emergency_result(result: CommandResult) {
@@ -212,13 +257,19 @@ fn queue_emergency_result(result: CommandResult) {
         return;
     };
     // CAN ownerはLoRa待ちをせず、専用queueへ委譲する。
-    if EMERGENCY_RESULT_LORA_CHANNEL.try_send(frame).is_err() {
+    let envelope = LoRaTxEnvelope::queued(
+        frame,
+        LoRaTxSource::EmergencyResult,
+        Instant::now().as_micros(),
+    );
+    if EMERGENCY_RESULT_LORA_CHANNEL.try_send(envelope).is_err() {
         LORA_TX_QUEUE_DROP_COUNT.fetch_add(1, Ordering::Relaxed);
+        LORA_EMERGENCY_RESULT_DROP_COUNT.fetch_add(1, Ordering::Relaxed);
         println!("Emergency result LoRa queue overflow");
     }
 }
 
-async fn queue_recovery_chunk(chunk: crate::can::recovery::RecoveryChunk) -> bool {
+fn queue_recovery_chunk(chunk: crate::can::recovery::RecoveryChunk) -> bool {
     let packet = ApplicationPacket::RecoveryLogData(RecoveryLogPacket {
         transfer_id: chunk.transfer_id,
         source: chunk.source == RecoverySource::MissionSdLatestFlight,
@@ -228,7 +279,17 @@ async fn queue_recovery_chunk(chunk: crate::can::recovery::RecoveryChunk) -> boo
         data: chunk.data,
     });
     match packet.encode() {
-        Ok(frame) if RECOVERY_LORA_CHANNEL.try_send(frame).is_ok() => true,
+        Ok(frame)
+            if RECOVERY_LORA_CHANNEL
+                .try_send(LoRaTxEnvelope::queued(
+                    frame,
+                    LoRaTxSource::Recovery,
+                    Instant::now().as_micros(),
+                ))
+                .is_ok() =>
+        {
+            true
+        }
         Ok(_) => {
             LORA_TX_QUEUE_DROP_COUNT.fetch_add(1, Ordering::Relaxed);
             println!("Recovery LoRa queue overflow: transfer stopped");
@@ -256,18 +317,21 @@ async fn fail_recovery_transfer(reason: crate::can::protocol::CommandReason, sto
     }
     let detail = resume.map_or(0, |value| value.offset);
     if let Some(result) = RECOVERY_SESSION.lock().await.fail(reason, detail) {
-        queue_application(ApplicationPacket::CommandResult(CommandResultPacket {
+        queue_command_result(CommandResultPacket {
             transaction_id: result.transaction_id,
             command: result.command,
             phase: result.phase,
             reason: result.reason,
             detail: result.detail,
-        }))
-        .await;
+        });
     }
 }
 
-async fn apply_received_message(message: CanRxMessage, received_at_ms: u64) {
+async fn apply_received_message(
+    message: CanRxMessage,
+    received_at_ms: u64,
+    previous_time_request_id: &mut Option<u8>,
+) {
     let update = CAN_CACHE.lock().await.update(message, received_at_ms);
     match update {
         CacheUpdate::CommandResult(result) => {
@@ -278,18 +342,17 @@ async fn apply_received_message(message: CanRxMessage, received_at_ms: u64) {
             if prioritize_untracked_emergency_result(matched, result.command) {
                 queue_emergency_result(result);
             } else {
-                queue_application(ApplicationPacket::CommandResult(CommandResultPacket {
+                queue_command_result(CommandResultPacket {
                     transaction_id: result.transaction_id,
                     command: result.command,
                     phase: result.phase,
                     reason: result.reason,
                     detail: result.detail,
-                }))
-                .await;
+                });
             }
         }
         CacheUpdate::TimeRequest { request_id } => {
-            queue_application(ApplicationPacket::GroundTimeRequest { request_id }).await;
+            queue_ground_time_request(request_id, previous_time_request_id);
         }
         CacheUpdate::MissionEvent { event, new_flags } => {
             println!(
@@ -306,7 +369,7 @@ async fn apply_received_message(message: CanRxMessage, received_at_ms: u64) {
             if status.status == RecoveryStatusCode::Complete {
                 let final_chunk = { RECOVERY_ASSEMBLER.lock().await.finish(status.transfer_id) };
                 if let Some(chunk) = final_chunk
-                    && !queue_recovery_chunk(chunk).await
+                    && !queue_recovery_chunk(chunk)
                 {
                     fail_recovery_transfer(
                         crate::can::protocol::CommandReason::InternalError,
@@ -317,20 +380,19 @@ async fn apply_received_message(message: CanRxMessage, received_at_ms: u64) {
                 }
             }
             if let Some(result) = RECOVERY_SESSION.lock().await.apply_status(status) {
-                queue_application(ApplicationPacket::CommandResult(CommandResultPacket {
+                queue_command_result(CommandResultPacket {
                     transaction_id: result.transaction_id,
                     command: result.command,
                     phase: result.phase,
                     reason: result.reason,
                     detail: result.detail,
-                }))
-                .await;
+                });
             }
         }
         CacheUpdate::RecoveryLogData(fragment) => {
             let assembly = { RECOVERY_ASSEMBLER.lock().await.push(fragment) };
             match assembly {
-                Ok(Some(chunk)) if !queue_recovery_chunk(chunk).await => {
+                Ok(Some(chunk)) if !queue_recovery_chunk(chunk) => {
                     fail_recovery_transfer(
                         crate::can::protocol::CommandReason::InternalError,
                         true,
@@ -353,7 +415,7 @@ async fn apply_received_message(message: CanRxMessage, received_at_ms: u64) {
     }
 }
 
-async fn handle_received_frame(frame: EspTwaiFrame) {
+async fn handle_received_frame(frame: EspTwaiFrame, previous_time_request_id: &mut Option<u8>) {
     let identifier = match frame.id() {
         Id::Standard(id) => id.as_raw(),
         Id::Extended(id) => {
@@ -375,7 +437,9 @@ async fn handle_received_frame(frame: EspTwaiFrame) {
     }
 
     match CanRxMessage::decode_standard(identifier, frame.data()) {
-        Ok(message) => apply_received_message(message, received_at_ms).await,
+        Ok(message) => {
+            apply_received_message(message, received_at_ms, previous_time_request_id).await
+        }
         Err(error) => {
             CAN_RX_ERROR_COUNT.fetch_add(1, Ordering::Relaxed);
             println!("invalid CAN frame: {:?}", error);
@@ -392,6 +456,7 @@ pub async fn can_communication_task(mut can: twai::Twai<'static, Async>) {
     let mut consecutive_rx_errors = 0u8;
     let mut observed = CanObservedStats::new();
     let mut health_ticks = 0u8;
+    let mut previous_time_request_id = None;
 
     loop {
         match select3(
@@ -442,16 +507,13 @@ pub async fn can_communication_task(mut can: twai::Twai<'static, Async>) {
                                             detail: 0,
                                         };
                                         if COMMAND_TRACKER.lock().await.apply_result(result) {
-                                            queue_application(ApplicationPacket::CommandResult(
-                                                CommandResultPacket {
-                                                    transaction_id: result.transaction_id,
-                                                    command: result.command,
-                                                    phase: result.phase,
-                                                    reason: result.reason,
-                                                    detail: result.detail,
-                                                },
-                                            ))
-                                            .await;
+                                            queue_command_result(CommandResultPacket {
+                                                transaction_id: result.transaction_id,
+                                                command: result.command,
+                                                phase: result.phase,
+                                                reason: result.reason,
+                                                detail: result.detail,
+                                            });
                                         }
                                     }
                                     crate::can::protocol::CanTxMessage::RecoveryControl(
@@ -465,16 +527,13 @@ pub async fn can_communication_task(mut can: twai::Twai<'static, Async>) {
                                             )
                                         {
                                             let _ = RECOVERY_ASSEMBLER.lock().await.abort();
-                                            queue_application(ApplicationPacket::CommandResult(
-                                                CommandResultPacket {
-                                                    transaction_id: result.transaction_id,
-                                                    command: result.command,
-                                                    phase: result.phase,
-                                                    reason: result.reason,
-                                                    detail: result.detail,
-                                                },
-                                            ))
-                                            .await;
+                                            queue_command_result(CommandResultPacket {
+                                                transaction_id: result.transaction_id,
+                                                command: result.command,
+                                                phase: result.phase,
+                                                reason: result.reason,
+                                                detail: result.detail,
+                                            });
                                         }
                                     }
                                     _ => {}
@@ -510,7 +569,7 @@ pub async fn can_communication_task(mut can: twai::Twai<'static, Async>) {
                     consecutive_rx_errors = 0;
                     runtime_state =
                         transition_runtime(runtime_state, CanRuntimeEvent::ReceiveSucceeded).0;
-                    handle_received_frame(frame).await;
+                    handle_received_frame(frame, &mut previous_time_request_id).await;
                 }
                 Err(error) => {
                     CAN_RX_ERROR_COUNT.fetch_add(1, Ordering::Relaxed);

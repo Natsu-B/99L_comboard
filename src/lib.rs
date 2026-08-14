@@ -4,6 +4,8 @@ pub mod can;
 #[cfg(target_arch = "xtensa")]
 pub mod constants;
 pub mod gnss;
+#[cfg(any(test, target_arch = "xtensa"))]
+mod lora_scheduler;
 #[cfg(all(target_arch = "xtensa", feature = "lora-timing-debug"))]
 mod lora_timing;
 pub mod lora_uplink;

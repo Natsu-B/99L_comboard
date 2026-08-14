@@ -11,8 +11,8 @@ use crate::{
         protocol::CanTxMessage,
         recovery::{RecoveryAssembler, RecoverySession},
     },
+    lora_scheduler::LoRaTxEnvelope,
     lora_uplink::UplinkCommand,
-    payload::LoraFrame,
 };
 
 pub type GnssPacket = [u8; 90];
@@ -95,10 +95,23 @@ pub static GNSS_CHANNEL: Channel<CriticalSectionRawMutex, GnssPacket, 5> = Chann
 pub static GNSS_CMD_CHANNEL: Channel<CriticalSectionRawMutex, GnssCommand, 2> = Channel::new();
 pub static UPLINK_COMMAND_CHANNEL: Channel<CriticalSectionRawMutex, UplinkCommand, 8> =
     Channel::new();
-pub static EMERGENCY_RESULT_LORA_CHANNEL: Channel<CriticalSectionRawMutex, LoraFrame, 16> =
+pub(crate) static EMERGENCY_RESULT_LORA_CHANNEL: Channel<
+    CriticalSectionRawMutex,
+    LoRaTxEnvelope,
+    16,
+> = Channel::new();
+pub(crate) static COMMAND_RESULT_LORA_CHANNEL: Channel<
+    CriticalSectionRawMutex,
+    LoRaTxEnvelope,
+    16,
+> = Channel::new();
+pub(crate) static GROUND_TIME_REQUEST_LORA_CHANNEL: Channel<
+    CriticalSectionRawMutex,
+    LoRaTxEnvelope,
+    8,
+> = Channel::new();
+pub(crate) static RECOVERY_LORA_CHANNEL: Channel<CriticalSectionRawMutex, LoRaTxEnvelope, 16> =
     Channel::new();
-pub static IMMEDIATE_LORA_CHANNEL: Channel<CriticalSectionRawMutex, LoraFrame, 8> = Channel::new();
-pub static RECOVERY_LORA_CHANNEL: Channel<CriticalSectionRawMutex, LoraFrame, 16> = Channel::new();
 pub static RAW_CAN_LOG_CHANNEL: Channel<CriticalSectionRawMutex, RawCanRecord, 32> = Channel::new();
 pub static CAN_TX_CHANNEL: Channel<CriticalSectionRawMutex, CanTxRequest, 8> = Channel::new();
 pub static CAN_SAFETY_TX_CHANNEL: Channel<CriticalSectionRawMutex, CanTxRequest, 8> =
@@ -125,6 +138,10 @@ pub static LORA_RX_BYTE_COUNT: AtomicU32 = AtomicU32::new(0);
 pub static LORA_TX_ERROR_COUNT: AtomicU32 = AtomicU32::new(0);
 pub static LORA_RX_ERROR_COUNT: AtomicU32 = AtomicU32::new(0);
 pub static LORA_TX_QUEUE_DROP_COUNT: AtomicU32 = AtomicU32::new(0);
+pub static LORA_EMERGENCY_RESULT_DROP_COUNT: AtomicU32 = AtomicU32::new(0);
+pub static LORA_GROUND_TIME_REQUEST_DROP_COUNT: AtomicU32 = AtomicU32::new(0);
+pub static LORA_GROUND_TIME_REQUEST_DUPLICATE_COUNT: AtomicU32 = AtomicU32::new(0);
+pub static LORA_PERIODIC_MISSED_SLOT_COUNT: AtomicU32 = AtomicU32::new(0);
 pub static LORA_COMMAND_DROP_COUNT: AtomicU32 = AtomicU32::new(0);
 pub static LORA_AUX_TIMEOUT_COUNT: AtomicU32 = AtomicU32::new(0);
 pub static GNSS_SETTING_ERROR_COUNT: AtomicU32 = AtomicU32::new(0);

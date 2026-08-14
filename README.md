@@ -8,8 +8,9 @@ ESP32-S3上でMission BoardのClassic CANを受信し、最新の`Natsu-B/Vault`
 - `src/can/cache.rs`: CAN IDごとのlatest value、受信時刻、freshness、MissionEvent OR latchを保持します。
 - `src/can/command.rs`: pending最大16件とresult cache 16件を管理し、duplicate replayと同一ID異payload拒否を行います。
 - `src/can/recovery.rs`: Recovery command lifecycle、6-byte CAN fragmentの16-byte A6結合、sequence gapとresume offsetを管理します。
+- `src/lora_scheduler.rs`: 500 ms absolute deadline、送信source優先度、B1 queue policy、Recovery fairnessとmissed slot処理を定義します。
 - `src/tasks/can_communication.rs`: TWAI唯一owner。RX、raw CAN logging、優先TX、bus-off recoveryを行います。
-- `src/tasks/lora_task.rs`: LoRa UART RX/TX唯一owner。uplink dispatchとA0〜A6/B0/B1生成を行います。
+- `src/tasks/lora_task.rs`: LoRa UART RX/TX唯一owner。uplink dispatch、A0〜A6/B0/B1生成、AUX Low→High完了確認とRX activity guardを行います。
 - `src/tasks/gnss_task.rs`: GNSS UART/enable唯一owner。receiver、configuration、fix、invalid、staleを区別します。
 - `src/tasks/sd_task.rs`: SD SPI唯一owner。受信したraw CANを`CAN.CSV`へ記録します。
 
@@ -27,6 +28,14 @@ cargo clippy --all-targets -- -D warnings
 
 PATH=/path/to/xtensa-esp-elf/bin:$PATH \
   cargo build --release --features firmware \
+  --target xtensa-esp32s3-none-elf -Z build-std=core
+```
+
+LoRa timingの実機診断では`lora-timing-debug`を追加します。10送信ごとにsource別件数、request/queue/AUX/UART/物理送信/idle、missed slotとtimestamp異常を`LORA_TIMING`へ出力します。
+
+```sh
+PATH=/path/to/xtensa-esp-elf/bin:$PATH \
+  cargo build --release --features firmware,lora-timing-debug \
   --target xtensa-esp32s3-none-elf -Z build-std=core
 ```
 
@@ -56,6 +65,10 @@ uplinkは固定11 byteです。
 transaction ID 0、checksum不一致、kind不明、Emergencyの非zero予約fieldは拒否します。Generic commandはCAN送信成功後にのみStartSequence連動のSD/GNSS副作用を開始します。CAN送信失敗結果もcacheし、同一requestへreplayします。
 
 Recovery A6はtransfer IDとsequenceを検証します。gap、encode失敗、LoRa queue overflow時は結合を停止し、確認できたresume offsetをB0 detailへ返し、MissionへStopLogDumpを試行します。
+
+LoRa TXは直前送信からの相対待機ではなく、500 msのabsolute deadlineを維持します。期限超過slotはburstで追送せずmissedとして進めます。送信優先度は`EmergencyResult > CommandResult(B0) > GroundTimeRequest(B1) > Recovery(A6) > periodic(A0〜A5)`です。B1は専用bounded queueを使い、同一request IDの連続duplicateを抑止し、満杯時はoldestをdropしてcounterへ記録します。
+
+送信前はAUX Highを確認し、最後のLoRa RX activityから60 msを確保してAUX Highを再確認します。UART flush後は15 ms以内のAUX Low開始と、その後のHigh復帰を物理送信完了条件にします。旧`fixed350` post-TX waitは使いません。実測値と判定は[docs/hardware_test_results.md](docs/hardware_test_results.md#lora-absolute-scheduler追試2026-08-14)に記録しています。
 
 ## Hardware assumptions
 
@@ -96,3 +109,5 @@ cargo check --test sd_log_verify --features hardware-test \
 - GNSS receiver/configurationと屋内NO_FIX/OFF stale-clearは実機確認済みです。屋外fixは未評価です。
 - 3基板でCAN 100 Hz系とLoRa 130秒連続通信を確認済みです。長時間・離距離・RF干渉・電源変動を含む耐久試験は別途必要です。
 - Emergency resultはgeneric transaction trackerに登録せず安全優先CAN queueで送ります。F0/F1はCAN ownerをblockしない専用priority LoRa queueへ送り、正常resultは実機PASS、CAN TX失敗時の`Failed/Timeout` B0はbuild/test PASSです。Mission非接続の実機失敗経路は未評価です。
+- **PASS**: ComBoardのabsolute scheduler、B1専用queue、AUX-RX guardはA0-onlyとA0+B1連続試験で確認済みです。Groundの安全boundary/AUX hardeningを含む最終artifactでは、0〜450 msの100位相試験が100/100成功し、`g 0x7F`/`le`の最大遅延は968.323/968.250 msでした。production復帰後は69.501秒で140 packet、全packet間隔平均500.007 ms、`g 0x7F`/`le`は909.386/909.339 msでfinal B0を返しました。CAN/LoRa/AUX/queue drop errorは0、診断logはproductionに残っていません。
+- **PARTIAL**: 全source同時競合のpriorityとB1満杯時oldest dropはhost testのみで、実機stressは未実施です。

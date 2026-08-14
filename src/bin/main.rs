@@ -9,15 +9,19 @@
 
 use core::sync::atomic::Ordering;
 
+#[cfg(feature = "lora-timing-debug")]
+use c99l_comboard::tasks::lora_timing_report_task;
 use c99l_comboard::{
     state::{
         CAN_HEALTH, CAN_REC, CAN_RX_ERROR_COUNT, CAN_RX_SUCCESS_COUNT, CAN_TEC, CAN_TX_ERROR_COUNT,
         CAN_TX_SUCCESS_COUNT, GNSS_CHANNEL_DROP_COUNT, GNSS_RX_ERROR_COUNT,
         GNSS_SETTING_ERROR_COUNT, GNSS_TELEMETRY, HAS_UNFLUSHED_DATA, IS_CAN_ERROR, LOGGING_ACTIVE,
-        LOGGING_REQUESTED, LORA_AUX_TIMEOUT_COUNT, LORA_COMMAND_DROP_COUNT, LORA_RX_BYTE_COUNT,
-        LORA_RX_ERROR_COUNT, LORA_RX_SUCCESS_COUNT, LORA_TX_ERROR_COUNT, LORA_TX_QUEUE_DROP_COUNT,
-        LORA_TX_SUCCESS_COUNT, RAW_CAN_LOG_DROPPED_COUNT, SD_DROPPED_ROW_COUNT, SD_HAS_ERROR,
-        SD_WRITE_ERROR_COUNT,
+        LOGGING_REQUESTED, LORA_AUX_TIMEOUT_COUNT, LORA_COMMAND_DROP_COUNT,
+        LORA_EMERGENCY_RESULT_DROP_COUNT, LORA_GROUND_TIME_REQUEST_DROP_COUNT,
+        LORA_GROUND_TIME_REQUEST_DUPLICATE_COUNT, LORA_PERIODIC_MISSED_SLOT_COUNT,
+        LORA_RX_BYTE_COUNT, LORA_RX_ERROR_COUNT, LORA_RX_SUCCESS_COUNT, LORA_TX_ERROR_COUNT,
+        LORA_TX_QUEUE_DROP_COUNT, LORA_TX_SUCCESS_COUNT, RAW_CAN_LOG_DROPPED_COUNT,
+        SD_DROPPED_ROW_COUNT, SD_HAS_ERROR, SD_WRITE_ERROR_COUNT,
     },
     tasks::{
         SdTimeSource, SdVolumeManager, can_communication_task, command_process_task,
@@ -143,6 +147,8 @@ async fn main(spawner0: Spawner) -> ! {
     spawner0.spawn(gnss_manager_task(uart1, gnss_en).unwrap());
     // Keep blocking SD traffic off the core reserved for LoRa and optional CAN tasks.
     spawner0.spawn(sd_write_task(volume_mgr, sd_logging_led).unwrap());
+    #[cfg(feature = "lora-timing-debug")]
+    spawner0.spawn(lora_timing_report_task().unwrap());
 
     esp_rtos::start_second_core(
         peripherals.CPU_CTRL,
@@ -200,7 +206,7 @@ async fn main(spawner0: Spawner) -> ! {
             hwstat_ticks = 0;
             let gnss = *GNSS_TELEMETRY.lock().await;
             println!(
-                "HWSTAT can_err={} can_health={} tec={} rec={} can_tx_ok={} can_rx_ok={} can_tx_err={} can_rx_err={} lora_tx_ok={} lora_rx_ok={} lora_rx_bytes={} lora_tx_err={} lora_rx_err={} lora_aux_timeout={} lora_tx_qdrop={} lora_cmd_drop={} sd_req={} sd_active={} sd_error={} sd_dirty={} sd_write_err={} sd_row_drop={} can_log_drop={} gnss={:?} east={} north={} height={} gnss_setting_err={} gnss_rx_err={} gnss_drop={}",
+                "HWSTAT can_err={} can_health={} tec={} rec={} can_tx_ok={} can_rx_ok={} can_tx_err={} can_rx_err={} lora_tx_ok={} lora_rx_ok={} lora_rx_bytes={} lora_tx_err={} lora_rx_err={} lora_aux_timeout={} lora_tx_qdrop={} lora_emergency_drop={} lora_b1_drop={} lora_b1_dup={} lora_periodic_missed={} lora_cmd_drop={} sd_req={} sd_active={} sd_error={} sd_dirty={} sd_write_err={} sd_row_drop={} can_log_drop={} gnss={:?} east={} north={} height={} gnss_setting_err={} gnss_rx_err={} gnss_drop={}",
                 IS_CAN_ERROR.load(Ordering::Relaxed),
                 CAN_HEALTH.load(Ordering::Relaxed),
                 CAN_TEC.load(Ordering::Relaxed),
@@ -216,6 +222,10 @@ async fn main(spawner0: Spawner) -> ! {
                 LORA_RX_ERROR_COUNT.load(Ordering::Relaxed),
                 LORA_AUX_TIMEOUT_COUNT.load(Ordering::Relaxed),
                 LORA_TX_QUEUE_DROP_COUNT.load(Ordering::Relaxed),
+                LORA_EMERGENCY_RESULT_DROP_COUNT.load(Ordering::Relaxed),
+                LORA_GROUND_TIME_REQUEST_DROP_COUNT.load(Ordering::Relaxed),
+                LORA_GROUND_TIME_REQUEST_DUPLICATE_COUNT.load(Ordering::Relaxed),
+                LORA_PERIODIC_MISSED_SLOT_COUNT.load(Ordering::Relaxed),
                 LORA_COMMAND_DROP_COUNT.load(Ordering::Relaxed),
                 LOGGING_REQUESTED.load(Ordering::Relaxed),
                 LOGGING_ACTIVE.load(Ordering::Relaxed),
