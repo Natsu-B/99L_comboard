@@ -502,6 +502,7 @@ mod tests {
         })
         .encode()
         .unwrap();
+        assert_eq!(frame.as_bytes(), golden("LORA_MISSION_LINK_FALLBACK"));
         let app = &frame.as_bytes()[LORA_PREFIX.len()..];
         assert_eq!(app.len(), 24);
         assert_eq!(&app[..4], &[0xa8, 0x01, 0x34, 0x01]);
