@@ -18,6 +18,7 @@ pub enum PacketHeader {
     RecoveryBeacon = 0xa5,
     RecoveryLogData = 0xa6,
     ControlRollTelemetryV2 = 0xa7,
+    MissionLinkFallbackTelemetry = 0xa8,
     CommandResult = 0xb0,
     GroundTimeRequest = 0xb1,
 }
@@ -85,6 +86,24 @@ pub struct RecoveryBeacon {
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct MissionLinkFallbackTelemetry {
+    pub sequence: u8,
+    pub primary_loss_reason: u8,
+    pub status_flags: u16,
+    pub last_valid_mission_state: u8,
+    pub gnss_state: u8,
+    pub mission_status_age: u16,
+    pub any_mission_periodic_age: u16,
+    pub power_time_age: u16,
+    pub east: u16,
+    pub north: u16,
+    pub height: u16,
+    pub logic_voltage: u8,
+    pub motor_voltage: u8,
+    pub can_health: u8,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct RecoveryLogPacket {
     pub transfer_id: u8,
     pub source: bool,
@@ -117,6 +136,7 @@ pub enum ApplicationPacket {
     Flight(FlightTelemetry),
     Descent(DescentTelemetry),
     RecoveryBeacon(RecoveryBeacon),
+    MissionLinkFallbackTelemetry(MissionLinkFallbackTelemetry),
     RecoveryLogData(RecoveryLogPacket),
     CommandResult(CommandResultPacket),
     GroundTimeRequest { request_id: u8 },
@@ -158,6 +178,9 @@ impl ApplicationPacket {
             Self::Flight(value) => encode_flight(&mut writer, value)?,
             Self::Descent(value) => encode_descent(&mut writer, value)?,
             Self::RecoveryBeacon(value) => encode_recovery_beacon(&mut writer, value)?,
+            Self::MissionLinkFallbackTelemetry(value) => {
+                encode_mission_link_fallback(&mut writer, value)?
+            }
             Self::RecoveryLogData(value) => encode_recovery_log(&mut writer, value)?,
             Self::CommandResult(value) => encode_command_result(&mut writer, value)?,
             Self::GroundTimeRequest { request_id } => {
@@ -268,6 +291,37 @@ fn encode_recovery_beacon(
     writer.write(value.height as u32, 9)?;
     writer.write(value.elapsed as u32, 16)?;
     writer.write(0, 7)
+}
+
+fn encode_mission_link_fallback(
+    writer: &mut BitWriter<'_>,
+    value: MissionLinkFallbackTelemetry,
+) -> Result<(), EncodeError> {
+    if value.primary_loss_reason > 7
+        || value.status_flags & 0x8000 != 0
+        || (value.last_valid_mission_state > 4 && value.last_valid_mission_state != 0xff)
+        || value.gnss_state > 8
+        || value.height > 0x01ff
+        || value.can_health > 6
+    {
+        return Err(EncodeError::InvalidField);
+    }
+    writer.write(PacketHeader::MissionLinkFallbackTelemetry as u32, 8)?;
+    writer.write(1, 8)?;
+    writer.write(value.sequence as u32, 8)?;
+    writer.write(value.primary_loss_reason as u32, 8)?;
+    writer.write(value.status_flags as u32, 16)?;
+    writer.write(value.last_valid_mission_state as u32, 8)?;
+    writer.write(value.gnss_state as u32, 8)?;
+    writer.write(value.mission_status_age as u32, 16)?;
+    writer.write(value.any_mission_periodic_age as u32, 16)?;
+    writer.write(value.power_time_age as u32, 16)?;
+    writer.write(value.east as u32, 16)?;
+    writer.write(value.north as u32, 16)?;
+    writer.write(value.height as u32, 16)?;
+    writer.write(value.logic_voltage as u32, 8)?;
+    writer.write(value.motor_voltage as u32, 8)?;
+    writer.write(value.can_health as u32, 8)
 }
 
 fn encode_recovery_log(
@@ -426,6 +480,32 @@ mod tests {
                 reference_capture_event_sequence: 0x2a,
             });
         assert_eq!(inconsistent.encode(), Err(EncodeError::InvalidField));
+    }
+
+    #[test]
+    fn mission_link_fallback_encodes_vault_v1_layout() {
+        let frame = ApplicationPacket::MissionLinkFallbackTelemetry(MissionLinkFallbackTelemetry {
+            sequence: 0x34,
+            primary_loss_reason: 1,
+            status_flags: 0x3fff,
+            last_valid_mission_state: 3,
+            gnss_state: 6,
+            mission_status_age: 10,
+            any_mission_periodic_age: 2,
+            power_time_age: 12,
+            east: 0xfff4,
+            north: 0x0022,
+            height: 0x0028,
+            logic_voltage: 0xa0,
+            motor_voltage: 0xdc,
+            can_health: 1,
+        })
+        .encode()
+        .unwrap();
+        let app = &frame.as_bytes()[LORA_PREFIX.len()..];
+        assert_eq!(app.len(), 24);
+        assert_eq!(&app[..4], &[0xa8, 0x01, 0x34, 0x01]);
+        assert_eq!(app[23], xor_checksum(&app[..23]));
     }
 
     #[test]

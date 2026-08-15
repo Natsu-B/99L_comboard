@@ -177,7 +177,6 @@ wire_enum!(TimeSource {
 });
 
 wire_enum!(RecoveryOpcode {
-    EnterRecovery = 0,
     Wake = 1,
     StartLogDump = 2,
     StopLogDump = 3,
@@ -550,6 +549,13 @@ impl CanRxMessage {
             CAN_ID_MISSION_STATUS => {
                 require_dlc(id, data, 8)?;
                 let state = decode_field(id, 1, data[1], MissionState::decode)?;
+                if state == MissionState::Unknown {
+                    return Err(CanDecodeError::InvalidField {
+                        id,
+                        index: 1,
+                        value: data[1],
+                    });
+                }
                 let fin_mode = decode_field(id, 5, data[5], FinMode::decode)?;
                 let para_mode = decode_field(id, 6, data[6], ParaMode::decode)?;
                 Ok(Self::MissionStatus(MissionStatusTelemetry {
@@ -564,6 +570,7 @@ impl CanRxMessage {
             }
             CAN_ID_POWER_TIME => {
                 require_dlc(id, data, 8)?;
+                require_reserved_zero(id, 7, data[7], 0x78)?;
                 Ok(Self::PowerTime(PowerTimeTelemetry {
                     sequence: data[0],
                     logic_voltage: data[1],
@@ -575,7 +582,8 @@ impl CanRxMessage {
             }
             CAN_ID_DESCENT_CORE => {
                 require_dlc(id, data, 4)?;
-                require_reserved_zero(id, 2, data[2], 0xe0)?;
+                require_reserved_zero(id, 1, data[1], 0xe0)?;
+                require_reserved_zero(id, 2, data[2], 0xff)?;
                 Ok(Self::DescentCore(DescentCoreTelemetry {
                     sequence: data[0],
                     status: get_u16(&data[1..3]),
@@ -930,14 +938,14 @@ mod tests {
                 motor_voltage: 0xdc,
                 descent_elapsed: 0xfffa,
                 recovery_elapsed: 0x000c,
-                flags: 0x65,
+                flags: 0x85,
             }))
         );
         assert_eq!(
             CanRxMessage::decode_standard(CAN_ID_DESCENT_CORE, &golden("CAN_104")),
             Ok(CanRxMessage::DescentCore(DescentCoreTelemetry {
                 sequence: 0xfb,
-                status: 0x1a55,
+                status: 0x0015,
                 para_angle: 0xf7,
             }))
         );
@@ -1054,7 +1062,15 @@ mod tests {
             Err(CanDecodeError::InvalidField { .. })
         ));
         assert!(matches!(
-            CanRxMessage::decode_standard(CAN_ID_DESCENT_CORE, &[0, 0, 0x20, 0]),
+            CanRxMessage::decode_standard(CAN_ID_POWER_TIME, &[0, 0, 0, 0, 0, 0, 0, 0x08]),
+            Err(CanDecodeError::InvalidField { .. })
+        ));
+        assert!(matches!(
+            CanRxMessage::decode_standard(CAN_ID_DESCENT_CORE, &[0, 0x20, 0, 0]),
+            Err(CanDecodeError::InvalidField { .. })
+        ));
+        assert!(matches!(
+            CanRxMessage::decode_standard(CAN_ID_DESCENT_CORE, &[0, 0, 0x01, 0]),
             Err(CanDecodeError::InvalidField { .. })
         ));
         assert!(matches!(
@@ -1073,6 +1089,9 @@ mod tests {
         assert!(CanRxMessage::decode_standard(CAN_ID_MISSION_STATUS, &status).is_err());
 
         let mut recovery = golden("CAN_105");
+        recovery[0] = 0;
+        assert!(CanRxMessage::decode_standard(CAN_ID_RECOVERY_STATUS, &recovery).is_err());
+        recovery[0] = RecoveryOpcode::StartLogDump as u8;
         recovery[2] = 10;
         assert!(CanRxMessage::decode_standard(CAN_ID_RECOVERY_STATUS, &recovery).is_err());
         recovery[2] = RecoveryStatusCode::Ready as u8;
@@ -1090,10 +1109,10 @@ mod tests {
     }
 
     #[test]
-    fn unknown_mission_state_is_valid() {
+    fn unknown_mission_status_state_is_rejected() {
         let mut status = golden("CAN_102");
         status[1] = MissionState::Unknown as u8;
-        assert!(CanRxMessage::decode_standard(CAN_ID_MISSION_STATUS, &status).is_ok());
+        assert!(CanRxMessage::decode_standard(CAN_ID_MISSION_STATUS, &status).is_err());
 
         let mut control_roll = golden("CAN_10A_POS");
         control_roll[1] = 1;
