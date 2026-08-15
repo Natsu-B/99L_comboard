@@ -34,8 +34,9 @@ use crate::{
         EMERGENCY_RESULT_LORA_CHANNEL, GNSS_CMD_CHANNEL, GROUND_TIME_REQUEST_LORA_CHANNEL,
         GnssCommand, IS_CAN_ERROR, LOGGING_REQUESTED, LORA_EMERGENCY_RESULT_DROP_COUNT,
         LORA_GROUND_TIME_REQUEST_DROP_COUNT, LORA_GROUND_TIME_REQUEST_DUPLICATE_COUNT,
-        LORA_TX_QUEUE_DROP_COUNT, RAW_CAN_LOG_CHANNEL, RAW_CAN_LOG_DROPPED_COUNT,
-        RECOVERY_ASSEMBLER, RECOVERY_LORA_CHANNEL, RECOVERY_SESSION, RawCanRecord,
+        LORA_TX_QUEUE_DROP_COUNT, MISSION_STATUS_INVALID_AT_MS, RAW_CAN_LOG_CHANNEL,
+        RAW_CAN_LOG_DROPPED_COUNT, RECOVERY_ASSEMBLER, RECOVERY_BEACON_ACTIVE,
+        RECOVERY_ENTER_SENT, RECOVERY_LORA_CHANNEL, RECOVERY_SESSION, RawCanRecord,
     },
 };
 
@@ -435,6 +436,17 @@ async fn apply_received_message(
     }
 }
 
+fn handle_recovery_mode_command(data: &[u8]) -> bool {
+    // Vault 04: ID 0x014 / DLC 3 / mode=1 / reason=0..3のみ有効。
+    if data.len() != 3 || data[1] != 1 || data[2] > 3 {
+        return false;
+    }
+    // sequenceはu8 wrap可。同じEnterRecoveryBeaconの再受信はidempotent。
+    RECOVERY_BEACON_ACTIVE.store(true, Ordering::Relaxed);
+    RECOVERY_ENTER_SENT.store(true, Ordering::Relaxed);
+    true
+}
+
 async fn handle_received_frame(frame: EspTwaiFrame, previous_time_request_id: &mut Option<u8>) {
     let identifier = match frame.id() {
         Id::Standard(id) => id.as_raw(),
@@ -456,11 +468,26 @@ async fn handle_received_frame(frame: EspTwaiFrame, previous_time_request_id: &m
         RAW_CAN_LOG_DROPPED_COUNT.fetch_add(1, Ordering::Relaxed);
     }
 
+    if identifier == 0x014 {
+        if !handle_recovery_mode_command(frame.data()) {
+            CAN_RX_ERROR_COUNT.fetch_add(1, Ordering::Relaxed);
+            println!("invalid RecoveryModeCommand");
+        }
+        return;
+    }
+
     match CanRxMessage::decode_standard(identifier, frame.data()) {
         Ok(message) => {
+            if identifier == 0x102 {
+                MISSION_STATUS_INVALID_AT_MS.store(0, Ordering::Relaxed);
+            }
             apply_received_message(message, received_at_ms, previous_time_request_id).await
         }
         Err(error) => {
+            if identifier == 0x102 {
+                let observed = received_at_ms.min(u32::MAX as u64) as u32;
+                MISSION_STATUS_INVALID_AT_MS.store(observed.max(1), Ordering::Relaxed);
+            }
             CAN_RX_ERROR_COUNT.fetch_add(1, Ordering::Relaxed);
             println!("invalid CAN frame: {:?}", error);
         }
@@ -631,5 +658,20 @@ pub async fn can_communication_task(mut can: twai::Twai<'static, Async>) {
             consecutive_rx_errors,
             mission_status_fresh,
         );
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn recovery_mode_command_requires_vault_layout() {
+        RECOVERY_BEACON_ACTIVE.store(false, Ordering::Relaxed);
+        assert!(handle_recovery_mode_command(&[0x10, 1, 0]));
+        assert!(RECOVERY_BEACON_ACTIVE.load(Ordering::Relaxed));
+        assert!(!handle_recovery_mode_command(&[0x10, 0, 0]));
+        assert!(!handle_recovery_mode_command(&[0x10, 1, 4]));
+        assert!(!handle_recovery_mode_command(&[0x10, 1]));
     }
 }
