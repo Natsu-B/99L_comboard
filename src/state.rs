@@ -132,6 +132,7 @@ pub static IS_CAN_ERROR: AtomicBool = AtomicBool::new(true);
 pub static CAN_TEC: AtomicU8 = AtomicU8::new(0);
 pub static CAN_REC: AtomicU8 = AtomicU8::new(0);
 pub static CAN_HEALTH: AtomicU8 = AtomicU8::new(0);
+pub static CAN_FALLBACK_HEALTH: AtomicU8 = AtomicU8::new(0);
 pub static CAN_TX_SUCCESS_COUNT: AtomicU32 = AtomicU32::new(0);
 pub static CAN_RX_SUCCESS_COUNT: AtomicU32 = AtomicU32::new(0);
 pub static CAN_TX_ERROR_COUNT: AtomicU32 = AtomicU32::new(0);

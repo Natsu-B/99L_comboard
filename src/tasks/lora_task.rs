@@ -39,7 +39,7 @@ use crate::{
         MissionLinkFallbackTelemetry, PacketHeader, RecoveryBeacon,
     },
     state::{
-        CAN_CACHE, CAN_HEALTH, CAN_SAFETY_TX_CHANNEL, CAN_TX_CHANNEL,
+        CAN_CACHE, CAN_FALLBACK_HEALTH, CAN_SAFETY_TX_CHANNEL, CAN_TX_CHANNEL,
         COMMAND_RESULT_LORA_CHANNEL, COMMAND_TRACKER, CONTROL_ROLL_LORA_SIGNAL,
         CanTxRequest, EMERGENCY_RESULT_LORA_CHANNEL, GNSS_CMD_CHANNEL, GNSS_TELEMETRY,
         GROUND_TIME_REQUEST_LORA_CHANNEL, GnssCommand, GnssReceiverState, HAS_UNFLUSHED_DATA,
@@ -395,19 +395,61 @@ const fn gnss_state_code(state: GnssReceiverState) -> u8 {
 }
 
 fn fallback_can_health() -> u8 {
-    match CAN_HEALTH.load(Ordering::Relaxed) {
-        0 => 1, // ACTIVE
-        1 => 2, // WARNING
-        2 => 3, // PASSIVE
-        3 => 4, // BUS_OFF
-        _ => 0,
+    CAN_FALLBACK_HEALTH.load(Ordering::Relaxed)
+}
+
+const fn fallback_primary_loss_reason(
+    can_health: u8,
+    invalid_is_latest: bool,
+    mission_ever: bool,
+    mission_age: u16,
+    periodic_ever: bool,
+    any_periodic_age: u16,
+) -> u8 {
+    if can_health == 4 {
+        3 // CAN_BUS_OFF
+    } else if can_health == 5 {
+        4 // CAN_RECOVERING
+    } else if can_health == 6 {
+        7 // UNKNOWN。controller errorはcan_healthで識別する。
+    } else if invalid_is_latest {
+        5 // MISSION_STATUS_INVALID
+    } else if !mission_ever {
+        0 // STARTUP_WAITING
+    } else if mission_age != 0xffff && mission_age < 10 {
+        // 300 ms以上1 s未満はageとstatus bit2でMISSION STATUS LATEを表す。
+        7 // UNKNOWN
+    } else if periodic_ever && any_periodic_age != 0xffff && any_periodic_age < 10 {
+        1 // MISSION_STATUS_TIMEOUT
+    } else {
+        2 // NO_MISSION_TRAFFIC
     }
+}
+
+const fn fallback_can_status_flags(can_health: u8) -> u16 {
+    let mut flags = 0;
+    if can_health >= 1 && can_health <= 3 {
+        flags |= 1 << 13;
+    }
+    if can_health >= 2 && can_health <= 6 {
+        flags |= 1 << 14;
+    }
+    flags
 }
 
 fn mission_link_fallback_packet(
     cache: &crate::can::cache::CanCache,
     now_ms: u64,
     gnss: crate::state::GnssTelemetry,
+) -> ApplicationPacket {
+    mission_link_fallback_packet_with_health(cache, now_ms, gnss, fallback_can_health())
+}
+
+fn mission_link_fallback_packet_with_health(
+    cache: &crate::can::cache::CanCache,
+    now_ms: u64,
+    gnss: crate::state::GnssTelemetry,
+    can_health: u8,
 ) -> ApplicationPacket {
     let mission_received = cache.mission_status.received_at_ms();
     let any_periodic_received = latest_mission_periodic_at(cache);
@@ -419,21 +461,14 @@ fn mission_link_fallback_packet(
     let periodic_ever = any_periodic_received.is_some();
     let invalid_at = MISSION_STATUS_INVALID_AT_MS.load(Ordering::Relaxed) as u64;
     let invalid_is_latest = invalid_at != 0 && mission_received.is_none_or(|valid_at| invalid_at > valid_at);
-    let can_health = fallback_can_health();
-    let primary_loss_reason = if can_health == 4 {
-        3 // CAN_BUS_OFF
-    } else if invalid_is_latest {
-        5 // MISSION_STATUS_INVALID
-    } else if !mission_ever {
-        0 // STARTUP_WAITING
-    } else if mission_age != 0xffff && mission_age < 10 {
-        // VaultはA8開始を300 ms、TIMEOUTを1 s以上とするが中間reasonを定義していない。
-        7 // UNKNOWN。status bit2/ageでGroundがMISSION STATUS LATEと表示する。
-    } else if periodic_ever && any_periodic_age != 0xffff && any_periodic_age < 10 {
-        1 // MISSION_STATUS_TIMEOUT
-    } else {
-        2 // NO_MISSION_TRAFFIC
-    };
+    let primary_loss_reason = fallback_primary_loss_reason(
+        can_health,
+        invalid_is_latest,
+        mission_ever,
+        mission_age,
+        periodic_ever,
+        any_periodic_age,
+    );
     let mut flags = 0u16;
     flags |= u16::from(mission_ever) << 0;
     flags |= u16::from(periodic_ever) << 1;
@@ -448,8 +483,7 @@ fn mission_link_fallback_packet(
     flags |= u16::from(gnss.state == GnssReceiverState::Stale) << 10;
     flags |= u16::from(power_received.is_some()) << 11;
     flags |= u16::from(mission_ever) << 12;
-    flags |= u16::from(can_health == 1) << 13;
-    flags |= u16::from(matches!(can_health, 2..=4)) << 14;
+    flags |= fallback_can_status_flags(can_health);
 
     let last_state = cache.mission_status.value().map_or(0xff, |status| status.state as u8);
     let power = cache.power_time.value();
@@ -522,6 +556,7 @@ async fn periodic_packet(
         );
     }
     if control_roll_event_only {
+        // event駆動経路はA7専用とし、A8を含む通常packetは500 ms周期でのみ生成する。
         return None;
     }
 
@@ -1383,15 +1418,43 @@ mod tests {
     fn missing_mission_status_is_startup_fallback() {
         let cache = CanCache::new();
         let gnss = crate::state::GnssTelemetry::new();
-        CAN_HEALTH.store(0, Ordering::Relaxed);
         MISSION_STATUS_INVALID_AT_MS.store(0, Ordering::Relaxed);
-        let packet = mission_link_fallback_packet(&cache, 1_000, gnss);
+        let packet = mission_link_fallback_packet_with_health(&cache, 1_000, gnss, 1);
         let ApplicationPacket::MissionLinkFallbackTelemetry(value) = packet else {
             panic!("expected fallback telemetry");
         };
         assert_eq!(value.primary_loss_reason, 0);
         assert_eq!(value.last_valid_mission_state, 0xff);
         assert_eq!(value.mission_status_age, 0xffff);
+        assert_ne!(value.status_flags & (1 << 13), 0);
+        assert_eq!(value.status_flags & (1 << 14), 0);
+    }
+
+    #[test]
+    fn fallback_reports_recovering_and_controller_error() {
+        let cache = CanCache::new();
+        let gnss = crate::state::GnssTelemetry::new();
+        MISSION_STATUS_INVALID_AT_MS.store(0, Ordering::Relaxed);
+
+        let ApplicationPacket::MissionLinkFallbackTelemetry(recovering) =
+            mission_link_fallback_packet_with_health(&cache, 1_000, gnss, 5)
+        else {
+            panic!("expected fallback telemetry");
+        };
+        assert_eq!(recovering.primary_loss_reason, 4);
+        assert_eq!(recovering.can_health, 5);
+        assert_eq!(recovering.status_flags & (1 << 13), 0);
+        assert_ne!(recovering.status_flags & (1 << 14), 0);
+
+        let ApplicationPacket::MissionLinkFallbackTelemetry(controller_error) =
+            mission_link_fallback_packet_with_health(&cache, 1_000, gnss, 6)
+        else {
+            panic!("expected fallback telemetry");
+        };
+        assert_eq!(controller_error.primary_loss_reason, 7);
+        assert_eq!(controller_error.can_health, 6);
+        assert_eq!(controller_error.status_flags & (1 << 13), 0);
+        assert_ne!(controller_error.status_flags & (1 << 14), 0);
     }
 
     #[test]

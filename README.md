@@ -12,7 +12,7 @@ ESP32-S3上でMission BoardのClassic CANを受信し、最新の`Natsu-B/Vault`
 - `src/can/recovery.rs`: Recovery command lifecycle、6-byte CAN fragmentの16-byte A6結合、sequence gapとresume offsetを管理します。
 - `src/lora_scheduler.rs`: 500 ms absolute deadline、送信source優先度、B1 queue policy、Recovery fairnessとmissed slot処理を定義します。
 - `src/tasks/can_communication.rs`: TWAI唯一owner。RX、raw CAN logging、優先TX、bus-off recoveryを行います。
-- `src/tasks/lora_task.rs`: LoRa UART RX/TX唯一owner。uplink dispatch、A0〜A7/B0/B1生成、AUX Low→High完了確認とRX activity guardを行います。
+- `src/tasks/lora_task.rs`: LoRa UART RX/TX唯一owner。uplink dispatch、A0〜A8/B0/B1生成、AUX Low→High完了確認とRX activity guardを行います。
 - `src/tasks/gnss_task.rs`: GNSS UART/enable唯一owner。receiver、configuration、fix、invalid、staleを区別します。
 - `src/tasks/sd_task.rs`: SD SPI唯一owner。受信したraw CANを`CAN.CSV`へ記録し、0x10Aのdecoded値はversioned `ROLLV2.CSV`へ分離します。
 
@@ -52,11 +52,13 @@ espflash flash --chip esp32s3 --port /dev/ttyACM<N> \
 
 ## Protocol
 
-CANは11-bit standard ID、125 kbit/s、payload 8 byte以下です。対応IDは`0x001`、`0x002`、`0x008`、`0x010`〜`0x013`、`0x020`、`0x100`〜`0x109`です。Mission由来raw量子化値は再量子化せず、LoRa packet組立時にcache snapshotを使用します。
+CANは11-bit standard ID、125 kbit/s、payload 8 byte以下です。対応IDは`0x001`、`0x002`、`0x008`、`0x010`〜`0x014`、`0x020`、`0x100`〜`0x10A`です。Mission由来raw量子化値は再量子化せず、LoRa packet組立時にcache snapshotを使用します。
 
 freshness初期値は100 Hz系30 ms、LPS 120 ms、10 Hz系300 ms、GNSS 3000 msです。stale値は04aのreserved rawへ置換します。MissionEventはsequence duplicateを抑止し、A1〜A3 Flight packetへ実際に載せたbitだけ送信成功後にclearします。
 
-LoRa downlinkはA0 22 byte、A1〜A3 24 byte、A4 15 byte、A5 12 byte、A6 24 byte、B0 10 byte、B1 3 byteです。E220固定送信prefixは`00 00 04`、bit packingはLSB-first、XORはheaderからpaddingまでです。A1〜A4は約0.5秒、A5 RecoveryBeaconは約10秒、A6は最大5 Hzです。
+LoRa downlinkはA0 22 byte、A1〜A3 24 byte、A4 15 byte、A5 12 byte、A6 24 byte、A7 9 byte、A8 24 byte、B0 10 byte、B1 3 byteです。E220固定送信prefixは`00 00 04`、bit packingはLSB-first、XORはheaderからpaddingまでです。A1〜A4、A7、A8は約0.5秒、A5 RecoveryBeaconは約10秒、A6は最大5 Hzです。
+
+A8はmode entryやreason/GNSS/CAN health変化を契機とする前倒し・追加送信を行わず、500 ms absolute periodic deadlineで通常生成します。送信競合時は既存の共通schedulerのpriority/fairness policyを適用し、A8専用の追加deadlineやretryは設けません。
 
 uplinkは固定11 byteです。
 
@@ -68,7 +70,7 @@ transaction ID 0、checksum不一致、kind不明、Emergencyの非zero予約fie
 
 Recovery A6はtransfer IDとsequenceを検証します。gap、encode失敗、LoRa queue overflow時は結合を停止し、確認できたresume offsetをB0 detailへ返し、MissionへStopLogDumpを試行します。
 
-LoRa TXは直前送信からの相対待機ではなく、500 msのabsolute deadlineを維持します。期限超過slotはburstで追送せずmissedとして進めます。送信優先度は`EmergencyResult > CommandResult(B0) > GroundTimeRequest(B1) > Recovery(A6) > periodic(A0〜A5)`です。B1は専用bounded queueを使い、同一request IDの連続duplicateを抑止し、満杯時はoldestをdropしてcounterへ記録します。
+LoRa TXは直前送信からの相対待機ではなく、500 msのabsolute deadlineを維持します。期限超過slotはburstで追送せずmissedとして進めます。送信優先度は`EmergencyResult > CommandResult(B0) > GroundTimeRequest(B1) > Recovery(A6) > periodic(A0〜A8)`です。B1は専用bounded queueを使い、同一request IDの連続duplicateを抑止し、満杯時はoldestをdropしてcounterへ記録します。
 
 送信前はAUX Highを確認し、最後のLoRa RX activityから60 msを確保してAUX Highを再確認します。UART flush後は15 ms以内のAUX Low開始と、その後のHigh復帰を物理送信完了条件にします。旧`fixed350` post-TX waitは使いません。実測値と判定は[docs/hardware_test_results.md](docs/hardware_test_results.md#lora-absolute-scheduler追試2026-08-14)に記録しています。
 
@@ -81,7 +83,7 @@ LoRa TXは直前送信からの相対待機ではなく、500 msのabsolute dead
 
 ## Test
 
-`testdata/99l_protocol_golden_vectors.txt`はMission/Groundと同一です。host testは全CAN field、LoRa A0〜A6/B0/B1、uplink、reserved/error raw、freshness、MissionEvent、transaction replay、Recovery gap/partial/EOF、GNSS rangeを検証します。
+`testdata/99l_protocol_golden_vectors.txt`はMission/Groundと同一です。host testは全CAN field、LoRa A0〜A8/B0/B1、uplink、reserved/error raw、freshness、MissionEvent、transaction replay、Recovery gap/partial/EOF、GNSS rangeを検証します。
 
 ```sh
 cargo fmt --all -- --check

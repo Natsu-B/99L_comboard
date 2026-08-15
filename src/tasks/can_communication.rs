@@ -28,7 +28,7 @@ use crate::{
     },
     payload::{ApplicationPacket, CommandResultPacket, RecoveryLogPacket},
     state::{
-        CAN_CACHE, CAN_HEALTH, CAN_REC, CAN_RX_ERROR_COUNT, CAN_RX_SUCCESS_COUNT,
+        CAN_CACHE, CAN_FALLBACK_HEALTH, CAN_HEALTH, CAN_REC, CAN_RX_ERROR_COUNT,
         CAN_SAFETY_TX_CHANNEL, CAN_TEC, CAN_TX_CHANNEL, CAN_TX_ERROR_COUNT, CAN_TX_SUCCESS_COUNT,
         COMMAND_RESULT_LORA_CHANNEL, COMMAND_TRACKER, CONTROL_ROLL_LORA_SIGNAL,
         EMERGENCY_RESULT_LORA_CHANNEL, GNSS_CMD_CHANNEL, GROUND_TIME_REQUEST_LORA_CHANNEL,
@@ -177,6 +177,24 @@ fn publish_health(can: &twai::Twai<'static, Async>) -> CanHealth {
     CAN_REC.store(rec, Ordering::Relaxed);
     CAN_HEALTH.store(health as u8, Ordering::Relaxed);
     health
+}
+
+const fn fallback_health_code(state: CanRuntimeState, health: CanHealth) -> u8 {
+    match state {
+        CanRuntimeState::BusRecovering => 5,
+        CanRuntimeState::TxStateUnknown => 6,
+        CanRuntimeState::AwaitingTraffic | CanRuntimeState::Normal => match health {
+            CanHealth::Active => 1,
+            CanHealth::Warning => 2,
+            CanHealth::Passive => 3,
+            CanHealth::BusOff => 4,
+        },
+    }
+}
+
+fn publish_fallback_health(state: CanRuntimeState, health: CanHealth) {
+    // A8ではTWAI error counterに加え、driverの復旧状態も公開する。
+    CAN_FALLBACK_HEALTH.store(fallback_health_code(state, health), Ordering::Relaxed);
 }
 
 fn publish_error_state(
@@ -505,6 +523,10 @@ pub async fn can_communication_task(mut can: twai::Twai<'static, Async>) {
     let mut health_ticks = 0u8;
     let mut previous_time_request_id = None;
 
+    // LoRa taskの最初のperiodic slotより前にも有効なA8 CAN healthを公開する。
+    let initial_health = publish_health(&can);
+    publish_fallback_health(runtime_state, initial_health);
+
     loop {
         match select3(
             health_ticker.next(),
@@ -645,6 +667,7 @@ pub async fn can_communication_task(mut can: twai::Twai<'static, Async>) {
             }
         }
         let health = publish_health(&can);
+        publish_fallback_health(runtime_state, health);
         let mission_status_fresh = CAN_CACHE
             .lock()
             .await
@@ -673,5 +696,33 @@ mod tests {
         assert!(!handle_recovery_mode_command(&[0x10, 0, 0]));
         assert!(!handle_recovery_mode_command(&[0x10, 1, 4]));
         assert!(!handle_recovery_mode_command(&[0x10, 1]));
+    }
+
+    #[test]
+    fn fallback_health_exposes_runtime_recovery_states() {
+        assert_eq!(
+            fallback_health_code(CanRuntimeState::Normal, CanHealth::Active),
+            1
+        );
+        assert_eq!(
+            fallback_health_code(CanRuntimeState::Normal, CanHealth::Warning),
+            2
+        );
+        assert_eq!(
+            fallback_health_code(CanRuntimeState::Normal, CanHealth::Passive),
+            3
+        );
+        assert_eq!(
+            fallback_health_code(CanRuntimeState::Normal, CanHealth::BusOff),
+            4
+        );
+        assert_eq!(
+            fallback_health_code(CanRuntimeState::BusRecovering, CanHealth::Active),
+            5
+        );
+        assert_eq!(
+            fallback_health_code(CanRuntimeState::TxStateUnknown, CanHealth::Active),
+            6
+        );
     }
 }
