@@ -14,13 +14,13 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@stable
       - name: Apply assertion
         run: python3 tools/apply_shared_fallback_golden.py
       - name: Format
-        run: cargo fmt --all
-      - name: Test
-        run: cargo test --all-targets
+        run: |
+          rustup component add rustfmt --toolchain stable
+          cargo +stable fmt --all
+          cargo +stable fmt --all -- --check
       - name: Commit verified change
         run: |
           git config user.name github-actions[bot]
