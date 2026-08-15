@@ -35,17 +35,19 @@ use crate::{
     lora_uplink::{UplinkCommand, UplinkFrameBuffer},
     payload::{
         ApplicationPacket, CommandReceiveTelemetry, CommandResultPacket,
-        ControlRollTelemetryV2Packet, DescentTelemetry, FlightTelemetry, LoraFrame, PacketHeader,
-        RecoveryBeacon,
+        ControlRollTelemetryV2Packet, DescentTelemetry, FlightTelemetry, LoraFrame,
+        MissionLinkFallbackTelemetry, PacketHeader, RecoveryBeacon,
     },
     state::{
-        CAN_CACHE, CAN_SAFETY_TX_CHANNEL, CAN_TX_CHANNEL, COMMAND_RESULT_LORA_CHANNEL,
-        COMMAND_TRACKER, CONTROL_ROLL_LORA_SIGNAL, CanTxRequest, EMERGENCY_RESULT_LORA_CHANNEL,
-        GNSS_CMD_CHANNEL, GNSS_TELEMETRY, GROUND_TIME_REQUEST_LORA_CHANNEL, GnssCommand,
-        IS_CAN_ERROR, LOGGING_REQUESTED, LORA_AUX_TIMEOUT_COUNT, LORA_COMMAND_DROP_COUNT,
-        LORA_PERIODIC_MISSED_SLOT_COUNT, LORA_RX_BYTE_COUNT, LORA_RX_ERROR_COUNT,
-        LORA_RX_SUCCESS_COUNT, LORA_TX_ERROR_COUNT, LORA_TX_QUEUE_DROP_COUNT,
-        LORA_TX_SUCCESS_COUNT, RECOVERY_ASSEMBLER, RECOVERY_BEACON_ACTIVE, RECOVERY_ENTER_SENT,
+        CAN_CACHE, CAN_HEALTH, CAN_SAFETY_TX_CHANNEL, CAN_TX_CHANNEL,
+        COMMAND_RESULT_LORA_CHANNEL, COMMAND_TRACKER, CONTROL_ROLL_LORA_SIGNAL,
+        CanTxRequest, EMERGENCY_RESULT_LORA_CHANNEL, GNSS_CMD_CHANNEL, GNSS_TELEMETRY,
+        GROUND_TIME_REQUEST_LORA_CHANNEL, GnssCommand, GnssReceiverState, HAS_UNFLUSHED_DATA,
+        IS_CAN_ERROR, LOGGING_ACTIVE, LOGGING_REQUESTED, LORA_AUX_TIMEOUT_COUNT,
+        LORA_COMMAND_DROP_COUNT, LORA_PERIODIC_MISSED_SLOT_COUNT, LORA_RX_BYTE_COUNT,
+        LORA_RX_ERROR_COUNT, LORA_RX_SUCCESS_COUNT, LORA_TX_ERROR_COUNT,
+        LORA_TX_QUEUE_DROP_COUNT, LORA_TX_SUCCESS_COUNT, MISSION_LINK_FALLBACK_SEQUENCE,
+        MISSION_STATUS_INVALID_AT_MS, RECOVERY_ASSEMBLER, RECOVERY_BEACON_ACTIVE,
         RECOVERY_LORA_CHANNEL, RECOVERY_SESSION, SD_FLUSH_SIGNAL, SD_HAS_ERROR,
         UPLINK_COMMAND_CHANNEL,
     },
@@ -147,7 +149,6 @@ enum LocalCommand {
     StopLogging = b'm',
     GnssOn = b'g',
     GnssOff = b'h',
-    EnterRecovery = b'r',
     Wake = b'w',
     DumpInternalFlash = b'f',
     DumpMissionSd = b's',
@@ -161,11 +162,11 @@ impl LocalCommand {
             b'm' => Some(Self::StopLogging),
             b'g' => Some(Self::GnssOn),
             b'h' => Some(Self::GnssOff),
-            b'r' => Some(Self::EnterRecovery),
             b'w' => Some(Self::Wake),
             b'f' => Some(Self::DumpInternalFlash),
             b's' => Some(Self::DumpMissionSd),
             b'x' => Some(Self::StopDump),
+            // 旧r=ForceRecoveryBeaconはMission所有権に反するためNotSupportedへ落とす。
             _ => None,
         }
     }
@@ -352,6 +353,124 @@ fn stale_or<T: Copy>(
     }
 }
 
+fn age_tenths(now_ms: u64, received_at_ms: Option<u64>) -> u16 {
+    let Some(received_at_ms) = received_at_ms else {
+        return 0xffff;
+    };
+    if now_ms < received_at_ms {
+        return 0xffff;
+    }
+    ((now_ms - received_at_ms) / 100).min(0xfffe) as u16
+}
+
+fn latest_mission_periodic_at(cache: &crate::can::cache::CanCache) -> Option<u64> {
+    [
+        cache.kinematics.received_at_ms(),
+        cache.control.received_at_ms(),
+        cache.mission_status.received_at_ms(),
+        cache.power_time.received_at_ms(),
+        cache.descent_core.received_at_ms(),
+        cache.attitude_tilt.received_at_ms(),
+        cache.lps.received_at_ms(),
+        cache.airspeed.received_at_ms(),
+        cache.control_roll_v2.received_at_ms(),
+    ]
+    .into_iter()
+    .flatten()
+    .max()
+}
+
+const fn gnss_state_code(state: GnssReceiverState) -> u8 {
+    match state {
+        GnssReceiverState::Off => 0,
+        GnssReceiverState::Starting => 1,
+        GnssReceiverState::ReceiverDetected => 2,
+        GnssReceiverState::ConfigurationFailed => 3,
+        GnssReceiverState::ReceiverError => 4,
+        GnssReceiverState::NoFix => 5,
+        GnssReceiverState::ValidFix => 6,
+        GnssReceiverState::InvalidSample => 7,
+        GnssReceiverState::Stale => 8,
+    }
+}
+
+fn fallback_can_health() -> u8 {
+    match CAN_HEALTH.load(Ordering::Relaxed) {
+        0 => 1, // ACTIVE
+        1 => 2, // WARNING
+        2 => 3, // PASSIVE
+        3 => 4, // BUS_OFF
+        _ => 0,
+    }
+}
+
+fn mission_link_fallback_packet(
+    cache: &crate::can::cache::CanCache,
+    now_ms: u64,
+    gnss: crate::state::GnssTelemetry,
+) -> ApplicationPacket {
+    let mission_received = cache.mission_status.received_at_ms();
+    let any_periodic_received = latest_mission_periodic_at(cache);
+    let power_received = cache.power_time.received_at_ms();
+    let mission_age = age_tenths(now_ms, mission_received);
+    let any_periodic_age = age_tenths(now_ms, any_periodic_received);
+    let power_age = age_tenths(now_ms, power_received);
+    let mission_ever = mission_received.is_some();
+    let periodic_ever = any_periodic_received.is_some();
+    let invalid_at = MISSION_STATUS_INVALID_AT_MS.load(Ordering::Relaxed) as u64;
+    let invalid_is_latest = invalid_at != 0 && mission_received.is_none_or(|valid_at| invalid_at > valid_at);
+    let can_health = fallback_can_health();
+    let primary_loss_reason = if can_health == 4 {
+        3 // CAN_BUS_OFF
+    } else if invalid_is_latest {
+        5 // MISSION_STATUS_INVALID
+    } else if !mission_ever {
+        0 // STARTUP_WAITING
+    } else if mission_age != 0xffff && mission_age < 10 {
+        // VaultはA8開始を300 ms、TIMEOUTを1 s以上とするが中間reasonを定義していない。
+        7 // UNKNOWN。status bit2/ageでGroundがMISSION STATUS LATEと表示する。
+    } else if periodic_ever && any_periodic_age != 0xffff && any_periodic_age < 10 {
+        1 // MISSION_STATUS_TIMEOUT
+    } else {
+        2 // NO_MISSION_TRAFFIC
+    };
+    let mut flags = 0u16;
+    flags |= u16::from(mission_ever) << 0;
+    flags |= u16::from(periodic_ever) << 1;
+    flags |= u16::from(mission_age != 0xffff && mission_age < 10) << 2;
+    flags |= u16::from(any_periodic_age != 0xffff && any_periodic_age < 10) << 3;
+    flags |= u16::from(!SD_HAS_ERROR.load(Ordering::Relaxed)) << 4;
+    flags |= u16::from(LOGGING_REQUESTED.load(Ordering::Relaxed)) << 5;
+    flags |= u16::from(LOGGING_ACTIVE.load(Ordering::Relaxed)) << 6;
+    flags |= u16::from(HAS_UNFLUSHED_DATA.load(Ordering::Relaxed)) << 7;
+    flags |= u16::from(gnss.state != GnssReceiverState::Off) << 8;
+    flags |= u16::from(gnss.state == GnssReceiverState::ValidFix) << 9;
+    flags |= u16::from(gnss.state == GnssReceiverState::Stale) << 10;
+    flags |= u16::from(power_received.is_some()) << 11;
+    flags |= u16::from(mission_ever) << 12;
+    flags |= u16::from(can_health == 1) << 13;
+    flags |= u16::from(matches!(can_health, 2..=4)) << 14;
+
+    let last_state = cache.mission_status.value().map_or(0xff, |status| status.state as u8);
+    let power = cache.power_time.value();
+    ApplicationPacket::MissionLinkFallbackTelemetry(MissionLinkFallbackTelemetry {
+        sequence: MISSION_LINK_FALLBACK_SEQUENCE.fetch_add(1, Ordering::Relaxed),
+        primary_loss_reason,
+        status_flags: flags,
+        last_valid_mission_state: last_state,
+        gnss_state: gnss_state_code(gnss.state),
+        mission_status_age: mission_age,
+        any_mission_periodic_age: any_periodic_age,
+        power_time_age: power_age,
+        east: gnss.east,
+        north: gnss.north,
+        height: gnss.height,
+        logic_voltage: power.map_or(253, |value| value.logic_voltage),
+        motor_voltage: power.map_or(253, |value| value.motor_voltage),
+        can_health,
+    })
+}
+
 struct PeriodicPacket {
     frame: LoraFrame,
     transmitted_events: u16,
@@ -406,26 +525,8 @@ async fn periodic_packet(
         return None;
     }
 
-    if !RECOVERY_BEACON_ACTIVE.load(Ordering::Relaxed)
-        && state == MissionState::Descent
-        && power.is_some_and(|value| recovery_elapsed_reached(value.descent_elapsed))
-    {
-        RECOVERY_BEACON_ACTIVE.store(true, Ordering::Relaxed);
-    }
+    // RecoveryBeaconはMissionから0x014を受けた場合だけlatchedされる。
     if RECOVERY_BEACON_ACTIVE.load(Ordering::Relaxed) {
-        if !RECOVERY_ENTER_SENT.swap(true, Ordering::Relaxed) {
-            CAN_TX_CHANNEL
-                .send(CanTxRequest {
-                    message: CanTxMessage::RecoveryControl(RecoveryControl {
-                        opcode: RecoveryOpcode::EnterRecovery,
-                        source: RecoverySource::InternalFlash,
-                        transfer_id: 0xff,
-                        offset: 0,
-                        length: 0,
-                    }),
-                })
-                .await;
-        }
         let packet = ApplicationPacket::RecoveryBeacon(RecoveryBeacon {
             logic_voltage: power.map_or(253, |value| value.logic_voltage),
             motor_voltage: power.map_or(253, |value| value.motor_voltage),
@@ -445,8 +546,21 @@ async fn periodic_packet(
         );
     }
 
+    if state == MissionState::Unknown {
+        let packet = mission_link_fallback_packet(&cache, now_ms, gnss);
+        return finish_periodic_packet(packet, 0, event_revision).map(
+            |(frame, transmitted_events, event_revision)| PeriodicPacket {
+                frame,
+                transmitted_events,
+                event_revision,
+                is_control_roll_v2: false,
+                control_roll_cycle_available: false,
+            },
+        );
+    }
+
     let packet = match state {
-        MissionState::CommandReceive | MissionState::Unknown => {
+        MissionState::CommandReceive => {
             let mission_status = mission.map_or(0, |value| value.status);
             let config = mission.map_or(0, |value| value.config);
             let mut status = map_command_receive_status(
@@ -516,8 +630,8 @@ async fn periodic_packet(
         }
         MissionState::Descent => {
             let descent = stale_or(cache.descent_core, now_ms, FRESHNESS_100_HZ_MS);
-            let mut status = descent.map_or(0, |value| value.status);
-            status = inject_link_health(status, 5, 6) & 0x1fff;
+            // 最新Vaultではbit0..3=ParachuteDeploymentFailureCode、bit4=persistence corrupt、bit5..12=reserved。
+            let status = descent.map_or(0, |value| value.status) & 0x001f;
             ApplicationPacket::Descent(DescentTelemetry {
                 status,
                 pressure: lps.map_or(2039, |value| value.pressure),
@@ -529,6 +643,7 @@ async fn periodic_packet(
                 height: gnss.height,
             })
         }
+        MissionState::Unknown => unreachable!(),
     };
     let transmitted_events = if matches!(
         state,
@@ -599,8 +714,7 @@ fn map_command_receive_status(
         status |= u32::from(power.motor_voltage <= 240) << 9;
         status |= u32::from(power.flags & (1 << 2) != 0) << 10;
         status |= u32::from(power.flags & (1 << 0) != 0) << 13;
-        status |= u32::from(power.flags & (1 << 6) != 0) << 19;
-        status |= u32::from(power.flags & (1 << 5) != 0) << 20;
+        // PowerTime bit5/6は最新Vaultでreserved。Flash backup bitへ転用しない。
     }
     status |= u32::from(config & (1 << 3) != 0) << 16;
     status |= u32::from(config & (1 << 4) != 0) << 18;
@@ -627,10 +741,6 @@ const fn periodic_interval_ms(recovery_active: bool, control_roll_cycle_active: 
     } else {
         LORA_TRANSMIT_INTERVAL_MS
     }
-}
-
-const fn recovery_elapsed_reached(descent_elapsed: u16) -> bool {
-    descent_elapsed >= 1_200 && descent_elapsed < 0xfff0
 }
 
 const RECOVERY_LOG_INTERVAL_MS: u64 = 200;
@@ -797,13 +907,11 @@ async fn process_local(transaction_id: u8, command: u8, args: [u8; 6]) {
         }
         LocalCommand::GnssOn => GNSS_CMD_CHANNEL.send(GnssCommand::TurnOn).await,
         LocalCommand::GnssOff => GNSS_CMD_CHANNEL.send(GnssCommand::TurnOff).await,
-        LocalCommand::EnterRecovery
-        | LocalCommand::Wake
+        LocalCommand::Wake
         | LocalCommand::DumpInternalFlash
         | LocalCommand::DumpMissionSd
         | LocalCommand::StopDump => {
             let opcode = match command_value {
-                LocalCommand::EnterRecovery => RecoveryOpcode::EnterRecovery,
                 LocalCommand::Wake => RecoveryOpcode::Wake,
                 LocalCommand::DumpInternalFlash | LocalCommand::DumpMissionSd => {
                     RecoveryOpcode::StartLogDump
@@ -853,10 +961,6 @@ async fn process_local(transaction_id: u8, command: u8, args: [u8; 6]) {
             }
             if command_value == LocalCommand::StopDump {
                 let _ = RECOVERY_ASSEMBLER.lock().await.abort();
-            }
-            if command_value == LocalCommand::EnterRecovery {
-                RECOVERY_BEACON_ACTIVE.store(true, Ordering::Relaxed);
-                RECOVERY_ENTER_SENT.store(true, Ordering::Relaxed);
             }
             if opcode == RecoveryOpcode::StartLogDump {
                 RECOVERY_ASSEMBLER
@@ -1251,6 +1355,7 @@ pub async fn lora_tx_task(mut tx: UartTx<'static, Async>, mut aux_pin: Input<'st
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::can::cache::CanCache;
 
     #[test]
     fn recovery_beacon_uses_ten_second_interval() {
@@ -1267,11 +1372,30 @@ mod tests {
     }
 
     #[test]
-    fn recovery_transition_uses_valid_120_second_elapsed() {
-        assert!(!recovery_elapsed_reached(1_199));
-        assert!(recovery_elapsed_reached(1_200));
-        assert!(recovery_elapsed_reached(0xffef));
-        assert!(!recovery_elapsed_reached(0xfff0));
-        assert!(!recovery_elapsed_reached(0xffff));
+    fn fallback_age_uses_tenth_seconds_and_saturates() {
+        assert_eq!(age_tenths(1_300, Some(1_000)), 3);
+        assert_eq!(age_tenths(1_000, None), 0xffff);
+        assert_eq!(age_tenths(1, Some(2)), 0xffff);
+        assert_eq!(age_tenths(u64::MAX, Some(0)), 0xfffe);
+    }
+
+    #[test]
+    fn missing_mission_status_is_startup_fallback() {
+        let cache = CanCache::new();
+        let gnss = crate::state::GnssTelemetry::new();
+        CAN_HEALTH.store(0, Ordering::Relaxed);
+        MISSION_STATUS_INVALID_AT_MS.store(0, Ordering::Relaxed);
+        let packet = mission_link_fallback_packet(&cache, 1_000, gnss);
+        let ApplicationPacket::MissionLinkFallbackTelemetry(value) = packet else {
+            panic!("expected fallback telemetry");
+        };
+        assert_eq!(value.primary_loss_reason, 0);
+        assert_eq!(value.last_valid_mission_state, 0xff);
+        assert_eq!(value.mission_status_age, 0xffff);
+    }
+
+    #[test]
+    fn legacy_local_recovery_command_is_not_supported() {
+        assert_eq!(LocalCommand::decode(b'r'), None);
     }
 }
