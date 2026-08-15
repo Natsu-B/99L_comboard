@@ -1,7 +1,7 @@
 {
   "schema_version": 1,
   "vault_repository": "Natsu-B/Vault",
-  "vault_commit": "f789fdef395c7b066d838a8f566ea4984231ab34",
+  "vault_commit": "2a6fa974a9b7a50a9b9d574174262068e2e5b8bf",
   "source_contract": {
     "can": {
       "id": "0x10A",
