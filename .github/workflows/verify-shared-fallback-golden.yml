@@ -1,0 +1,31 @@
+name: verify-shared-fallback-golden
+
+on:
+  push:
+    branches:
+      - test/shared-fallback-golden-20260816
+
+permissions:
+  contents: write
+
+jobs:
+  verify:
+    if: github.actor != 'github-actions[bot]'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - name: Apply assertion
+        run: python3 tools/apply_shared_fallback_golden.py
+      - name: Format
+        run: cargo fmt --all
+      - name: Test
+        run: cargo test --all-targets
+      - name: Commit verified change
+        run: |
+          git config user.name github-actions[bot]
+          git config user.email 41898282+github-actions[bot]@users.noreply.github.com
+          git rm tools/apply_shared_fallback_golden.py .github/workflows/verify-shared-fallback-golden.yml
+          git add src/payload.rs
+          git commit -m "test(comboard): assert shared fallback golden"
+          git push origin HEAD:test/shared-fallback-golden-20260816
