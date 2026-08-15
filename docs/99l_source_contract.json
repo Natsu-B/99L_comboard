@@ -1,0 +1,37 @@
+{
+  "schema_version": 1,
+  "vault_repository": "Natsu-B/Vault",
+  "vault_commit": "f789fdef395c7b066d838a8f566ea4984231ab34",
+  "source_contract": {
+    "can": {
+      "id": "0x10A",
+      "name": "ControlRollTelemetryV2",
+      "schema_version": 2,
+      "layout": ["sequence_u8", "schema_version_u8", "control_roll_reference_unwrapped_signed16_le_0.5deg", "roll_deviation_unwrapped_signed16_le_0.5deg", "flags_u8", "reference_capture_event_sequence_u8"]
+    },
+    "lora": {"header": "0xA7", "name": "ControlRollTelemetryV2", "schema_version": 2, "nominal_period_ms": 500, "additional_send_on": ["reference_capture", "range_or_error_status_change"], "legacy_header_reinterpreted": false},
+    "shortest_path_recalculation_allowed": false,
+    "out_of_range_raw": "0x800A",
+    "out_of_range_behavior": "preserve_error_raw_and_flags_without_wrap_or_clamp",
+    "sd_decoded_schema": {
+      "file": "ROLLV2.CSV",
+      "columns": [
+        "Time_ms",
+        "SchemaVersion",
+        "ReferenceRawHex",
+        "DeviationRawHex",
+        "ReferenceCount",
+        "DeviationCount",
+        "ReferenceStatus",
+        "DeviationStatus",
+        "Flags",
+        "ReferenceCapturedEvent",
+        "ReferenceCaptureEventSequence"
+      ],
+      "legacy_raw_can_log_preserved": "CAN.CSV"
+    }
+  },
+  "phase8_status": "NOT_STARTED",
+  "phase9_final_retune_performed": false,
+  "production_selectable": false
+}

@@ -112,6 +112,7 @@ pub(crate) static GROUND_TIME_REQUEST_LORA_CHANNEL: Channel<
 > = Channel::new();
 pub(crate) static RECOVERY_LORA_CHANNEL: Channel<CriticalSectionRawMutex, LoRaTxEnvelope, 16> =
     Channel::new();
+pub(crate) static CONTROL_ROLL_LORA_SIGNAL: Signal<CriticalSectionRawMutex, ()> = Signal::new();
 pub static RAW_CAN_LOG_CHANNEL: Channel<CriticalSectionRawMutex, RawCanRecord, 32> = Channel::new();
 pub static CAN_TX_CHANNEL: Channel<CriticalSectionRawMutex, CanTxRequest, 8> = Channel::new();
 pub static CAN_SAFETY_TX_CHANNEL: Channel<CriticalSectionRawMutex, CanTxRequest, 8> =

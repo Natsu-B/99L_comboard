@@ -1,7 +1,7 @@
 use super::protocol::{
-    AirspeedTelemetry, AttitudeTiltTelemetry, CanRxMessage, CommandResult, ControlTelemetry,
-    DescentCoreTelemetry, KinematicsTelemetry, LpsTelemetry, MissionEvent, MissionStatusTelemetry,
-    PowerTimeTelemetry, RecoveryLogData, RecoveryStatus,
+    AirspeedTelemetry, AttitudeTiltTelemetry, CanRxMessage, CommandResult, ControlRollTelemetryV2,
+    ControlTelemetry, DescentCoreTelemetry, KinematicsTelemetry, LpsTelemetry, MissionEvent,
+    MissionStatusTelemetry, PowerTimeTelemetry, RecoveryLogData, RecoveryStatus,
 };
 
 pub const FRESHNESS_100_HZ_MS: u64 = 30;
@@ -10,7 +10,7 @@ pub const FRESHNESS_10_HZ_MS: u64 = 300;
 
 pub fn observed_sequence(identifier: u16, data: &[u8]) -> Option<u8> {
     match identifier {
-        0x020 | 0x100..=0x104 | 0x107..=0x109 => data.first().copied(),
+        0x020 | 0x100..=0x104 | 0x107..=0x10a => data.first().copied(),
         0x106 => data.get(1).copied(),
         _ => None,
     }
@@ -102,6 +102,7 @@ pub struct CanCache {
     pub attitude_tilt: Latest<AttitudeTiltTelemetry>,
     pub lps: Latest<LpsTelemetry>,
     pub airspeed: Latest<AirspeedTelemetry>,
+    pub control_roll_v2: Latest<ControlRollTelemetryV2>,
     pub recovery_status: Latest<RecoveryStatus>,
     pub recovery_log_data: Latest<RecoveryLogData>,
     pub command_result: Latest<CommandResult>,
@@ -123,6 +124,7 @@ impl CanCache {
             attitude_tilt: Latest::new(),
             lps: Latest::new(),
             airspeed: Latest::new(),
+            control_roll_v2: Latest::new(),
             recovery_status: Latest::new(),
             recovery_log_data: Latest::new(),
             command_result: Latest::new(),
@@ -195,6 +197,10 @@ impl CanCache {
                 self.airspeed.update(value, received_at_ms);
                 CacheUpdate::Telemetry
             }
+            CanRxMessage::ControlRollV2(value) => {
+                self.control_roll_v2.update(value, received_at_ms);
+                CacheUpdate::Telemetry
+            }
         }
     }
 
@@ -243,6 +249,24 @@ mod tests {
                 airspeed: 2,
             }),
             100,
+        );
+        cache.update(
+            CanRxMessage::ControlRollV2(ControlRollTelemetryV2 {
+                sequence: 3,
+                control_roll_reference_unwrapped_raw: 760,
+                roll_deviation_unwrapped_raw: 1440,
+                flags: 0x07,
+                reference_capture_event_sequence: 1,
+            }),
+            100,
+        );
+        assert_eq!(
+            cache
+                .control_roll_v2
+                .value()
+                .unwrap()
+                .roll_deviation_unwrapped_raw,
+            1440
         );
         cache.update(
             CanRxMessage::Lps(LpsTelemetry {

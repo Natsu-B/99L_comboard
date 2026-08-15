@@ -2,6 +2,8 @@
 
 ESP32-S3上でMission BoardのClassic CANを受信し、最新の`Natsu-B/Vault` 99L仕様に従うcompact LoRa packetへ中継する通信基板です。GNSS、通信基板microSD、Recovery中継もこのrepositoryが所有します。
 
+99L Control roll protocolの固定sourceとmigration状態は[`docs/99l_source_contract.json`](docs/99l_source_contract.json)を参照してください。CAN 0x10AとLoRa A7はunwrapped reference/deviationを保持し、ComBoardでは最短角へ再計算しません。A3を変更せず、flight中はA7を約0.5秒周期で追加し、reference captureまたはrange/error status変化で送信を追加要求します。
+
 ## Architecture
 
 - `src/can/protocol.rs`: 11-bit standard CAN codec。125 kbit/s、little-endian、DLCとreserved bitを検証します。
@@ -10,9 +12,9 @@ ESP32-S3上でMission BoardのClassic CANを受信し、最新の`Natsu-B/Vault`
 - `src/can/recovery.rs`: Recovery command lifecycle、6-byte CAN fragmentの16-byte A6結合、sequence gapとresume offsetを管理します。
 - `src/lora_scheduler.rs`: 500 ms absolute deadline、送信source優先度、B1 queue policy、Recovery fairnessとmissed slot処理を定義します。
 - `src/tasks/can_communication.rs`: TWAI唯一owner。RX、raw CAN logging、優先TX、bus-off recoveryを行います。
-- `src/tasks/lora_task.rs`: LoRa UART RX/TX唯一owner。uplink dispatch、A0〜A6/B0/B1生成、AUX Low→High完了確認とRX activity guardを行います。
+- `src/tasks/lora_task.rs`: LoRa UART RX/TX唯一owner。uplink dispatch、A0〜A7/B0/B1生成、AUX Low→High完了確認とRX activity guardを行います。
 - `src/tasks/gnss_task.rs`: GNSS UART/enable唯一owner。receiver、configuration、fix、invalid、staleを区別します。
-- `src/tasks/sd_task.rs`: SD SPI唯一owner。受信したraw CANを`CAN.CSV`へ記録します。
+- `src/tasks/sd_task.rs`: SD SPI唯一owner。受信したraw CANを`CAN.CSV`へ記録し、0x10Aのdecoded値はversioned `ROLLV2.CSV`へ分離します。
 
 CAN、LoRa、GNSS、SDはowner task以外から直接操作せず、bounded channelで要求を渡します。緊急uplinkは通常command queueを経由せず、専用CAN safety channelへ渡します。
 

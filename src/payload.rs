@@ -1,4 +1,7 @@
-use crate::can::protocol::{CommandPhase, CommandReason};
+use crate::can::protocol::{
+    CONTROL_ROLL_OUT_OF_RANGE_RAW, CONTROL_ROLL_SCHEMA_VERSION, CommandPhase, CommandReason,
+    ControlRollTelemetryV2 as CanControlRollTelemetryV2,
+};
 
 pub const LORA_PREFIX: [u8; 3] = [0x00, 0x00, 0x04];
 pub const MAX_APPLICATION_LENGTH: usize = 24;
@@ -14,6 +17,7 @@ pub enum PacketHeader {
     Descent = 0xa4,
     RecoveryBeacon = 0xa5,
     RecoveryLogData = 0xa6,
+    ControlRollTelemetryV2 = 0xa7,
     CommandResult = 0xb0,
     GroundTimeRequest = 0xb1,
 }
@@ -100,6 +104,14 @@ pub struct CommandResultPacket {
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct ControlRollTelemetryV2Packet {
+    pub control_roll_reference_unwrapped_raw: u16,
+    pub roll_deviation_unwrapped_raw: u16,
+    pub flags: u8,
+    pub reference_capture_event_sequence: u8,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum ApplicationPacket {
     CommandReceive(CommandReceiveTelemetry),
     Flight(FlightTelemetry),
@@ -108,6 +120,7 @@ pub enum ApplicationPacket {
     RecoveryLogData(RecoveryLogPacket),
     CommandResult(CommandResultPacket),
     GroundTimeRequest { request_id: u8 },
+    ControlRollTelemetryV2(ControlRollTelemetryV2Packet),
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -125,6 +138,7 @@ impl LoraFrame {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum EncodeError {
     InvalidHeader,
+    InvalidField,
     OutOfRange,
     ReservedTransactionId,
 }
@@ -149,6 +163,26 @@ impl ApplicationPacket {
             Self::GroundTimeRequest { request_id } => {
                 writer.write(PacketHeader::GroundTimeRequest as u32, 8)?;
                 writer.write(request_id as u32, 8)?;
+            }
+            Self::ControlRollTelemetryV2(value) => {
+                let reference_out_of_range =
+                    value.flags & CanControlRollTelemetryV2::REFERENCE_OUT_OF_RANGE != 0;
+                let deviation_out_of_range =
+                    value.flags & CanControlRollTelemetryV2::DEVIATION_OUT_OF_RANGE != 0;
+                if value.flags & 0xe0 != 0
+                    || (value.control_roll_reference_unwrapped_raw == CONTROL_ROLL_OUT_OF_RANGE_RAW)
+                        != reference_out_of_range
+                    || (value.roll_deviation_unwrapped_raw == CONTROL_ROLL_OUT_OF_RANGE_RAW)
+                        != deviation_out_of_range
+                {
+                    return Err(EncodeError::InvalidField);
+                }
+                writer.write(PacketHeader::ControlRollTelemetryV2 as u32, 8)?;
+                writer.write(CONTROL_ROLL_SCHEMA_VERSION as u32, 8)?;
+                writer.write(value.control_roll_reference_unwrapped_raw as u32, 16)?;
+                writer.write(value.roll_deviation_unwrapped_raw as u32, 16)?;
+                writer.write(value.flags as u32, 8)?;
+                writer.write(value.reference_capture_event_sequence as u32, 8)?;
             }
         }
 
@@ -349,6 +383,49 @@ mod tests {
         .encode()
         .unwrap();
         assert_eq!(frame.as_bytes(), golden("LORA_FLIGHT"));
+    }
+
+    #[test]
+    fn control_roll_v2_preserves_full_turn_counts() {
+        let frame = ApplicationPacket::ControlRollTelemetryV2(ControlRollTelemetryV2Packet {
+            control_roll_reference_unwrapped_raw: 760,
+            roll_deviation_unwrapped_raw: 1440,
+            flags: 0x07,
+            reference_capture_event_sequence: 0x2a,
+        })
+        .encode()
+        .unwrap();
+        assert_eq!(frame.as_bytes(), golden("LORA_CONTROL_ROLL_V2"));
+
+        let negative = ApplicationPacket::ControlRollTelemetryV2(ControlRollTelemetryV2Packet {
+            control_roll_reference_unwrapped_raw: 0,
+            roll_deviation_unwrapped_raw: (-1440_i16) as u16,
+            flags: 0x05,
+            reference_capture_event_sequence: 0x2a,
+        })
+        .encode()
+        .unwrap();
+        assert_eq!(&negative.as_bytes()[7..9], &[0x60, 0xfa]);
+
+        let out_of_range =
+            ApplicationPacket::ControlRollTelemetryV2(ControlRollTelemetryV2Packet {
+                control_roll_reference_unwrapped_raw: CONTROL_ROLL_OUT_OF_RANGE_RAW,
+                roll_deviation_unwrapped_raw: CONTROL_ROLL_OUT_OF_RANGE_RAW,
+                flags: 0x19,
+                reference_capture_event_sequence: 0x2b,
+            })
+            .encode()
+            .unwrap();
+        assert_eq!(&out_of_range.as_bytes()[5..9], &[0x0a, 0x80, 0x0a, 0x80]);
+
+        let inconsistent =
+            ApplicationPacket::ControlRollTelemetryV2(ControlRollTelemetryV2Packet {
+                control_roll_reference_unwrapped_raw: 760,
+                roll_deviation_unwrapped_raw: 1440,
+                flags: 0x0f,
+                reference_capture_event_sequence: 0x2a,
+            });
+        assert_eq!(inconsistent.encode(), Err(EncodeError::InvalidField));
     }
 
     #[test]

@@ -14,8 +14,8 @@ use crate::{
         cache::{CacheUpdate, FRESHNESS_10_HZ_MS, observed_sequence, sequence_gap},
         health::{CanHealth, classify_can_health},
         protocol::{
-            CanRxMessage, CanTxMessage, CommandResult, RecoveryControl, RecoveryOpcode,
-            RecoverySource, RecoveryStatusCode, emergency_failure_result,
+            CanRxMessage, CanTxMessage, CommandResult, ControlRollTelemetryV2, RecoveryControl,
+            RecoveryOpcode, RecoverySource, RecoveryStatusCode, emergency_failure_result,
             is_emergency_result_command, prioritize_untracked_emergency_result,
         },
         tx::{CanTxError, transmit_message_with_timeout},
@@ -30,12 +30,12 @@ use crate::{
     state::{
         CAN_CACHE, CAN_HEALTH, CAN_REC, CAN_RX_ERROR_COUNT, CAN_RX_SUCCESS_COUNT,
         CAN_SAFETY_TX_CHANNEL, CAN_TEC, CAN_TX_CHANNEL, CAN_TX_ERROR_COUNT, CAN_TX_SUCCESS_COUNT,
-        COMMAND_RESULT_LORA_CHANNEL, COMMAND_TRACKER, EMERGENCY_RESULT_LORA_CHANNEL,
-        GNSS_CMD_CHANNEL, GROUND_TIME_REQUEST_LORA_CHANNEL, GnssCommand, IS_CAN_ERROR,
-        LOGGING_REQUESTED, LORA_EMERGENCY_RESULT_DROP_COUNT, LORA_GROUND_TIME_REQUEST_DROP_COUNT,
-        LORA_GROUND_TIME_REQUEST_DUPLICATE_COUNT, LORA_TX_QUEUE_DROP_COUNT, RAW_CAN_LOG_CHANNEL,
-        RAW_CAN_LOG_DROPPED_COUNT, RECOVERY_ASSEMBLER, RECOVERY_LORA_CHANNEL, RECOVERY_SESSION,
-        RawCanRecord,
+        COMMAND_RESULT_LORA_CHANNEL, COMMAND_TRACKER, CONTROL_ROLL_LORA_SIGNAL,
+        EMERGENCY_RESULT_LORA_CHANNEL, GNSS_CMD_CHANNEL, GROUND_TIME_REQUEST_LORA_CHANNEL,
+        GnssCommand, IS_CAN_ERROR, LOGGING_REQUESTED, LORA_EMERGENCY_RESULT_DROP_COUNT,
+        LORA_GROUND_TIME_REQUEST_DROP_COUNT, LORA_GROUND_TIME_REQUEST_DUPLICATE_COUNT,
+        LORA_TX_QUEUE_DROP_COUNT, RAW_CAN_LOG_CHANNEL, RAW_CAN_LOG_DROPPED_COUNT,
+        RECOVERY_ASSEMBLER, RECOVERY_LORA_CHANNEL, RECOVERY_SESSION, RawCanRecord,
     },
 };
 
@@ -55,8 +55,9 @@ enum CanRuntimeEvent {
     TimedOutUnknownState,
 }
 
-const OBSERVED_CAN_IDS: [u16; 13] = [
+const OBSERVED_CAN_IDS: [u16; 14] = [
     0x011, 0x012, 0x020, 0x100, 0x101, 0x102, 0x103, 0x104, 0x105, 0x106, 0x107, 0x108, 0x109,
+    0x10a,
 ];
 
 struct CanObservedStats {
@@ -90,7 +91,7 @@ impl CanObservedStats {
 
     fn print(&self) {
         println!(
-            "CANID c011={} c012={} c020={} g020={} c100={} g100={} c101={} g101={} c102={} g102={} c103={} g103={} c104={} g104={} c105={} c106={} g106={} c107={} g107={} c108={} g108={} c109={} g109={}",
+            "CANID c011={} c012={} c020={} g020={} c100={} g100={} c101={} g101={} c102={} g102={} c103={} g103={} c104={} g104={} c105={} c106={} g106={} c107={} g107={} c108={} g108={} c109={} g109={} c10a={} g10a={}",
             self.counts[0],
             self.counts[1],
             self.counts[2],
@@ -114,6 +115,8 @@ impl CanObservedStats {
             self.sequence_gaps[11],
             self.counts[12],
             self.sequence_gaps[12],
+            self.counts[13],
+            self.sequence_gaps[13],
         );
     }
 }
@@ -332,7 +335,24 @@ async fn apply_received_message(
     received_at_ms: u64,
     previous_time_request_id: &mut Option<u8>,
 ) {
-    let update = CAN_CACHE.lock().await.update(message, received_at_ms);
+    let mut cache = CAN_CACHE.lock().await;
+    let signal_control_roll = match message {
+        CanRxMessage::ControlRollV2(current) => {
+            let capture_event = current.flags
+                & ControlRollTelemetryV2::REFERENCE_CAPTURED_SINCE_PREVIOUS_FRAME
+                != 0;
+            capture_event
+                || cache.control_roll_v2.value().is_some_and(|previous| {
+                    previous.status_signature() != current.status_signature()
+                })
+        }
+        _ => false,
+    };
+    let update = cache.update(message, received_at_ms);
+    drop(cache);
+    if signal_control_roll {
+        CONTROL_ROLL_LORA_SIGNAL.signal(());
+    }
     match update {
         CacheUpdate::CommandResult(result) => {
             let matched = COMMAND_TRACKER.lock().await.apply_result(result);

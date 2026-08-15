@@ -34,14 +34,15 @@ use crate::{
     },
     lora_uplink::{UplinkCommand, UplinkFrameBuffer},
     payload::{
-        ApplicationPacket, CommandReceiveTelemetry, CommandResultPacket, DescentTelemetry,
-        FlightTelemetry, LoraFrame, PacketHeader, RecoveryBeacon,
+        ApplicationPacket, CommandReceiveTelemetry, CommandResultPacket,
+        ControlRollTelemetryV2Packet, DescentTelemetry, FlightTelemetry, LoraFrame, PacketHeader,
+        RecoveryBeacon,
     },
     state::{
         CAN_CACHE, CAN_SAFETY_TX_CHANNEL, CAN_TX_CHANNEL, COMMAND_RESULT_LORA_CHANNEL,
-        COMMAND_TRACKER, CanTxRequest, EMERGENCY_RESULT_LORA_CHANNEL, GNSS_CMD_CHANNEL,
-        GNSS_TELEMETRY, GROUND_TIME_REQUEST_LORA_CHANNEL, GnssCommand, IS_CAN_ERROR,
-        LOGGING_REQUESTED, LORA_AUX_TIMEOUT_COUNT, LORA_COMMAND_DROP_COUNT,
+        COMMAND_TRACKER, CONTROL_ROLL_LORA_SIGNAL, CanTxRequest, EMERGENCY_RESULT_LORA_CHANNEL,
+        GNSS_CMD_CHANNEL, GNSS_TELEMETRY, GROUND_TIME_REQUEST_LORA_CHANNEL, GnssCommand,
+        IS_CAN_ERROR, LOGGING_REQUESTED, LORA_AUX_TIMEOUT_COUNT, LORA_COMMAND_DROP_COUNT,
         LORA_PERIODIC_MISSED_SLOT_COUNT, LORA_RX_BYTE_COUNT, LORA_RX_ERROR_COUNT,
         LORA_RX_SUCCESS_COUNT, LORA_TX_ERROR_COUNT, LORA_TX_QUEUE_DROP_COUNT,
         LORA_TX_SUCCESS_COUNT, RECOVERY_ASSEMBLER, RECOVERY_BEACON_ACTIVE, RECOVERY_ENTER_SENT,
@@ -351,7 +352,18 @@ fn stale_or<T: Copy>(
     }
 }
 
-async fn periodic_packet() -> Option<(LoraFrame, u16, u32)> {
+struct PeriodicPacket {
+    frame: LoraFrame,
+    transmitted_events: u16,
+    event_revision: u32,
+    is_control_roll_v2: bool,
+    control_roll_cycle_available: bool,
+}
+
+async fn periodic_packet(
+    prefer_control_roll_v2: bool,
+    control_roll_event_only: bool,
+) -> Option<PeriodicPacket> {
     let now_ms = Instant::now().as_millis();
     let cache = *CAN_CACHE.lock().await;
     let (interval_events, event_revision) = cache.event_snapshot();
@@ -364,6 +376,35 @@ async fn periodic_packet() -> Option<(LoraFrame, u16, u32)> {
     let lps = stale_or(cache.lps, now_ms, FRESHNESS_25_HZ_MS);
     let airspeed = stale_or(cache.airspeed, now_ms, FRESHNESS_100_HZ_MS);
     let power = stale_or(cache.power_time, now_ms, FRESHNESS_10_HZ_MS);
+    let control_roll_v2 = stale_or(cache.control_roll_v2, now_ms, FRESHNESS_10_HZ_MS);
+    let flight_state = matches!(
+        state,
+        MissionState::LiftoffDetection | MissionState::EngineBurn | MissionState::Control
+    );
+    let control_roll_cycle_available = flight_state && control_roll_v2.is_some();
+    if prefer_control_roll_v2
+        && control_roll_cycle_available
+        && let Some(value) = control_roll_v2
+    {
+        let packet = ApplicationPacket::ControlRollTelemetryV2(ControlRollTelemetryV2Packet {
+            control_roll_reference_unwrapped_raw: value.control_roll_reference_unwrapped_raw,
+            roll_deviation_unwrapped_raw: value.roll_deviation_unwrapped_raw,
+            flags: value.flags,
+            reference_capture_event_sequence: value.reference_capture_event_sequence,
+        });
+        return finish_periodic_packet(packet, 0, event_revision).map(
+            |(frame, transmitted_events, event_revision)| PeriodicPacket {
+                frame,
+                transmitted_events,
+                event_revision,
+                is_control_roll_v2: true,
+                control_roll_cycle_available: true,
+            },
+        );
+    }
+    if control_roll_event_only {
+        return None;
+    }
 
     if !RECOVERY_BEACON_ACTIVE.load(Ordering::Relaxed)
         && state == MissionState::Descent
@@ -393,7 +434,15 @@ async fn periodic_packet() -> Option<(LoraFrame, u16, u32)> {
             height: gnss.height,
             elapsed: power.map_or(0xfffa, |value| value.recovery_elapsed),
         });
-        return finish_periodic_packet(packet, 0, event_revision);
+        return finish_periodic_packet(packet, 0, event_revision).map(
+            |(frame, transmitted_events, event_revision)| PeriodicPacket {
+                frame,
+                transmitted_events,
+                event_revision,
+                is_control_roll_v2: false,
+                control_roll_cycle_available: false,
+            },
+        );
     }
 
     let packet = match state {
@@ -489,7 +538,15 @@ async fn periodic_packet() -> Option<(LoraFrame, u16, u32)> {
     } else {
         0
     };
-    finish_periodic_packet(packet, transmitted_events, event_revision)
+    finish_periodic_packet(packet, transmitted_events, event_revision).map(
+        |(frame, transmitted_events, event_revision)| PeriodicPacket {
+            frame,
+            transmitted_events,
+            event_revision,
+            is_control_roll_v2: false,
+            control_roll_cycle_available,
+        },
+    )
 }
 
 fn finish_periodic_packet(
@@ -562,9 +619,11 @@ fn map_flight_interval_events(events: u16) -> u16 {
     status
 }
 
-const fn periodic_interval_ms(recovery_active: bool) -> u64 {
+const fn periodic_interval_ms(recovery_active: bool, control_roll_cycle_active: bool) -> u64 {
     if recovery_active {
         10_000
+    } else if control_roll_cycle_active {
+        LORA_TRANSMIT_INTERVAL_MS / 2
     } else {
         LORA_TRANSMIT_INTERVAL_MS
     }
@@ -931,7 +990,9 @@ pub async fn lora_rx_task(mut rx: UartRx<'static, Async>) {
 
 #[embassy_executor::task]
 pub async fn lora_tx_task(mut tx: UartTx<'static, Async>, mut aux_pin: Input<'static>) {
-    let mut interval = Duration::from_millis(periodic_interval_ms(false));
+    let mut control_roll_cycle_active = false;
+    let mut prefer_control_roll_v2 = false;
+    let mut interval = Duration::from_millis(periodic_interval_ms(false, false));
     let (mut next_tx_at, mut periodic_deadline_valid) = match Instant::now().checked_add(interval) {
         Some(deadline) => (deadline, true),
         None => (Instant::MAX, false),
@@ -988,13 +1049,15 @@ pub async fn lora_tx_task(mut tx: UartTx<'static, Async>, mut aux_pin: Input<'st
                 }
                 Timer::at(scheduled_periodic_at).await;
             };
+            let control_roll_or_periodic_ready =
+                select(periodic_ready, CONTROL_ROLL_LORA_SIGNAL.wait());
             // select5は左からpollするため、この並びが送信優先度になる。
             match select5(
                 EMERGENCY_RESULT_LORA_CHANNEL.receive(),
                 COMMAND_RESULT_LORA_CHANNEL.receive(),
                 GROUND_TIME_REQUEST_LORA_CHANNEL.receive(),
                 recovery_ready,
-                periodic_ready,
+                control_roll_or_periodic_ready,
             )
             .await
             {
@@ -1015,9 +1078,10 @@ pub async fn lora_tx_task(mut tx: UartTx<'static, Async>, mut aux_pin: Input<'st
                         continue;
                     }
                 }
-                Either5::Fifth(()) => {
+                Either5::Fifth(Either::First(())) => {
                     interval = Duration::from_millis(periodic_interval_ms(
                         RECOVERY_BEACON_ACTIVE.load(Ordering::Relaxed),
+                        control_roll_cycle_active,
                     ));
                     regular_periodic_selected = !periodic_selection.retry_selected;
                     let consumption = consume_periodic_selection(
@@ -1037,7 +1101,7 @@ pub async fn lora_tx_task(mut tx: UartTx<'static, Async>, mut aux_pin: Input<'st
                         }
                     }
                     let requested_at_us = Instant::now().as_micros();
-                    let Some(frame) = periodic_packet().await else {
+                    let Some(frame) = periodic_packet(prefer_control_roll_v2, false).await else {
                         recovery_sent_since_periodic = update_recovery_fairness(
                             recovery_sent_since_periodic,
                             LoRaTxSource::Periodic,
@@ -1049,7 +1113,27 @@ pub async fn lora_tx_task(mut tx: UartTx<'static, Async>, mut aux_pin: Input<'st
                         }
                         continue;
                     };
-                    LoRaTxEnvelope::periodic(frame.0, requested_at_us, frame.1, frame.2)
+                    control_roll_cycle_active = frame.control_roll_cycle_available;
+                    prefer_control_roll_v2 =
+                        frame.control_roll_cycle_available && !frame.is_control_roll_v2;
+                    LoRaTxEnvelope::periodic(
+                        frame.frame,
+                        requested_at_us,
+                        frame.transmitted_events,
+                        frame.event_revision,
+                    )
+                }
+                Either5::Fifth(Either::Second(())) => {
+                    let requested_at_us = Instant::now().as_micros();
+                    let Some(frame) = periodic_packet(true, true).await else {
+                        continue;
+                    };
+                    LoRaTxEnvelope::periodic(
+                        frame.frame,
+                        requested_at_us,
+                        frame.transmitted_events,
+                        frame.event_revision,
+                    )
                 }
             }
         };
@@ -1170,8 +1254,9 @@ mod tests {
 
     #[test]
     fn recovery_beacon_uses_ten_second_interval() {
-        assert_eq!(periodic_interval_ms(false), 500);
-        assert_eq!(periodic_interval_ms(true), 10_000);
+        assert_eq!(periodic_interval_ms(false, false), 500);
+        assert_eq!(periodic_interval_ms(false, true), 250);
+        assert_eq!(periodic_interval_ms(true, true), 10_000);
     }
 
     #[test]

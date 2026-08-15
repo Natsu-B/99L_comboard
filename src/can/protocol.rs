@@ -16,6 +16,9 @@ pub const CAN_ID_RECOVERY_LOG_DATA: u16 = 0x106;
 pub const CAN_ID_ATTITUDE_TILT: u16 = 0x107;
 pub const CAN_ID_LPS: u16 = 0x108;
 pub const CAN_ID_AIRSPEED: u16 = 0x109;
+pub const CAN_ID_CONTROL_ROLL_V2: u16 = 0x10a;
+pub const CONTROL_ROLL_SCHEMA_VERSION: u8 = 2;
+pub const CONTROL_ROLL_OUT_OF_RANGE_RAW: u16 = 0x800a;
 
 #[cfg(any(target_arch = "xtensa", test))]
 pub(crate) const ACTUATOR_EMERGENCY_RESULT: u8 = 0xF0;
@@ -351,6 +354,58 @@ pub struct AirspeedTelemetry {
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct ControlRollTelemetryV2 {
+    pub sequence: u8,
+    pub control_roll_reference_unwrapped_raw: u16,
+    pub roll_deviation_unwrapped_raw: u16,
+    pub flags: u8,
+    pub reference_capture_event_sequence: u8,
+}
+
+impl ControlRollTelemetryV2 {
+    pub const REFERENCE_VALID: u8 = 1 << 0;
+    pub const REFERENCE_CAPTURED_SINCE_PREVIOUS_FRAME: u8 = 1 << 1;
+    pub const CONTROL_ACTIVE: u8 = 1 << 2;
+    pub const REFERENCE_OUT_OF_RANGE: u8 = 1 << 3;
+    pub const DEVIATION_OUT_OF_RANGE: u8 = 1 << 4;
+
+    pub const fn reference_count(self) -> Option<i16> {
+        decode_control_roll_count(self.control_roll_reference_unwrapped_raw)
+    }
+
+    pub const fn deviation_count(self) -> Option<i16> {
+        decode_control_roll_count(self.roll_deviation_unwrapped_raw)
+    }
+
+    pub const fn status_signature(self) -> u32 {
+        let status_flags = self.flags
+            & (Self::REFERENCE_VALID
+                | Self::CONTROL_ACTIVE
+                | Self::REFERENCE_OUT_OF_RANGE
+                | Self::DEVIATION_OUT_OF_RANGE);
+        status_flags as u32
+            | ((control_roll_quality_code(self.control_roll_reference_unwrapped_raw) as u32) << 8)
+            | ((control_roll_quality_code(self.roll_deviation_unwrapped_raw) as u32) << 13)
+    }
+}
+
+pub const fn decode_control_roll_count(raw: u16) -> Option<i16> {
+    if raw >= 0x8000 && raw <= 0x800f {
+        None
+    } else {
+        Some(raw as i16)
+    }
+}
+
+const fn control_roll_quality_code(raw: u16) -> u8 {
+    if raw >= 0x8000 && raw <= 0x800f {
+        ((raw & 0x000f) as u8) + 1
+    } else {
+        0
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum CanRxMessage {
     CommandResult(CommandResult),
     TimeRequest { request_id: u8 },
@@ -365,6 +420,7 @@ pub enum CanRxMessage {
     AttitudeTilt(AttitudeTiltTelemetry),
     Lps(LpsTelemetry),
     Airspeed(AirspeedTelemetry),
+    ControlRollV2(ControlRollTelemetryV2),
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -572,6 +628,39 @@ impl CanRxMessage {
                 Ok(Self::Airspeed(AirspeedTelemetry {
                     sequence: data[0],
                     airspeed: data[1],
+                }))
+            }
+            CAN_ID_CONTROL_ROLL_V2 => {
+                require_dlc(id, data, 8)?;
+                if data[1] != CONTROL_ROLL_SCHEMA_VERSION {
+                    return Err(CanDecodeError::InvalidField {
+                        id,
+                        index: 1,
+                        value: data[1],
+                    });
+                }
+                require_reserved_zero(id, 6, data[6], 0xe0)?;
+                let reference_raw = get_u16(&data[2..4]);
+                let deviation_raw = get_u16(&data[4..6]);
+                let reference_out_of_range =
+                    data[6] & ControlRollTelemetryV2::REFERENCE_OUT_OF_RANGE != 0;
+                let deviation_out_of_range =
+                    data[6] & ControlRollTelemetryV2::DEVIATION_OUT_OF_RANGE != 0;
+                if (reference_raw == CONTROL_ROLL_OUT_OF_RANGE_RAW) != reference_out_of_range
+                    || (deviation_raw == CONTROL_ROLL_OUT_OF_RANGE_RAW) != deviation_out_of_range
+                {
+                    return Err(CanDecodeError::InvalidField {
+                        id,
+                        index: 6,
+                        value: data[6],
+                    });
+                }
+                Ok(Self::ControlRollV2(ControlRollTelemetryV2 {
+                    sequence: data[0],
+                    control_roll_reference_unwrapped_raw: reference_raw,
+                    roll_deviation_unwrapped_raw: deviation_raw,
+                    flags: data[6],
+                    reference_capture_event_sequence: data[7],
                 }))
             }
             _ => Err(CanDecodeError::UnknownId(id)),
@@ -893,6 +982,69 @@ mod tests {
                 airspeed: 0x3d,
             }))
         );
+        assert_eq!(
+            CanRxMessage::decode_standard(CAN_ID_CONTROL_ROLL_V2, &golden("CAN_10A_POS")),
+            Ok(CanRxMessage::ControlRollV2(ControlRollTelemetryV2 {
+                sequence: 0xf7,
+                control_roll_reference_unwrapped_raw: 760,
+                roll_deviation_unwrapped_raw: 1440,
+                flags: 0x07,
+                reference_capture_event_sequence: 0x2a,
+            }))
+        );
+        assert_eq!(
+            CanRxMessage::decode_standard(CAN_ID_CONTROL_ROLL_V2, &golden("CAN_10A_NEG")),
+            Ok(CanRxMessage::ControlRollV2(ControlRollTelemetryV2 {
+                sequence: 0xf8,
+                control_roll_reference_unwrapped_raw: 0,
+                roll_deviation_unwrapped_raw: (-1440_i16) as u16,
+                flags: 0x05,
+                reference_capture_event_sequence: 0x2a,
+            }))
+        );
+        assert_eq!(
+            CanRxMessage::decode_standard(CAN_ID_CONTROL_ROLL_V2, &golden("CAN_10A_OUT_OF_RANGE")),
+            Ok(CanRxMessage::ControlRollV2(ControlRollTelemetryV2 {
+                sequence: 0xf9,
+                control_roll_reference_unwrapped_raw: CONTROL_ROLL_OUT_OF_RANGE_RAW,
+                roll_deviation_unwrapped_raw: CONTROL_ROLL_OUT_OF_RANGE_RAW,
+                flags: ControlRollTelemetryV2::REFERENCE_VALID
+                    | ControlRollTelemetryV2::REFERENCE_OUT_OF_RANGE
+                    | ControlRollTelemetryV2::DEVIATION_OUT_OF_RANGE,
+                reference_capture_event_sequence: 0x2b,
+            }))
+        );
+        assert_eq!(decode_control_roll_count(760), Some(760));
+        assert_eq!(decode_control_roll_count(1440), Some(1440));
+        assert_eq!(decode_control_roll_count((-1440_i16) as u16), Some(-1440));
+        assert_eq!(
+            decode_control_roll_count(CONTROL_ROLL_OUT_OF_RANGE_RAW),
+            None
+        );
+        let nominal =
+            match CanRxMessage::decode_standard(CAN_ID_CONTROL_ROLL_V2, &golden("CAN_10A_POS"))
+                .unwrap()
+            {
+                CanRxMessage::ControlRollV2(value) => value,
+                _ => unreachable!(),
+            };
+        let capture_flag_cleared = ControlRollTelemetryV2 {
+            flags: nominal.flags & !ControlRollTelemetryV2::REFERENCE_CAPTURED_SINCE_PREVIOUS_FRAME,
+            ..nominal
+        };
+        assert_eq!(
+            nominal.status_signature(),
+            capture_flag_cleared.status_signature()
+        );
+        assert_ne!(
+            nominal.status_signature(),
+            ControlRollTelemetryV2 {
+                flags: nominal.flags | ControlRollTelemetryV2::REFERENCE_OUT_OF_RANGE,
+                control_roll_reference_unwrapped_raw: CONTROL_ROLL_OUT_OF_RANGE_RAW,
+                ..nominal
+            }
+            .status_signature()
+        );
     }
 
     #[test]
@@ -942,5 +1094,18 @@ mod tests {
         let mut status = golden("CAN_102");
         status[1] = MissionState::Unknown as u8;
         assert!(CanRxMessage::decode_standard(CAN_ID_MISSION_STATUS, &status).is_ok());
+
+        let mut control_roll = golden("CAN_10A_POS");
+        control_roll[1] = 1;
+        assert!(CanRxMessage::decode_standard(CAN_ID_CONTROL_ROLL_V2, &control_roll).is_err());
+        control_roll = golden("CAN_10A_POS");
+        control_roll[6] = 0x80;
+        assert!(CanRxMessage::decode_standard(CAN_ID_CONTROL_ROLL_V2, &control_roll).is_err());
+        control_roll = golden("CAN_10A_POS");
+        control_roll[6] |= ControlRollTelemetryV2::REFERENCE_OUT_OF_RANGE;
+        assert!(CanRxMessage::decode_standard(CAN_ID_CONTROL_ROLL_V2, &control_roll).is_err());
+        control_roll = golden("CAN_10A_OUT_OF_RANGE");
+        control_roll[6] &= !ControlRollTelemetryV2::DEVIATION_OUT_OF_RANGE;
+        assert!(CanRxMessage::decode_standard(CAN_ID_CONTROL_ROLL_V2, &control_roll).is_err());
     }
 }
