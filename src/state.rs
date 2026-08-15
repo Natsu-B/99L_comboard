@@ -89,6 +89,9 @@ pub static RECOVERY_ASSEMBLER: Mutex<CriticalSectionRawMutex, RecoveryAssembler>
     Mutex::new(RecoveryAssembler::new());
 pub static RECOVERY_BEACON_ACTIVE: AtomicBool = AtomicBool::new(false);
 pub static RECOVERY_ENTER_SENT: AtomicBool = AtomicBool::new(false);
+pub static MISSION_LINK_FALLBACK_SEQUENCE: AtomicU8 = AtomicU8::new(0);
+// 0は「invalid MissionStatus未観測」。boot直後0 msとの衝突は診断上のみで安全動作へ影響しない。
+pub static MISSION_STATUS_INVALID_AT_MS: AtomicU32 = AtomicU32::new(0);
 pub static GNSS_TELEMETRY: Mutex<CriticalSectionRawMutex, GnssTelemetry> =
     Mutex::new(GnssTelemetry::new());
 pub static GNSS_CHANNEL: Channel<CriticalSectionRawMutex, GnssPacket, 5> = Channel::new();
