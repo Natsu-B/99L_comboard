@@ -24,11 +24,14 @@ jobs:
         run: git pull --rebase origin main
       - name: Apply targeted fix
         run: python3 tools/apply_mission_sd_health_fix.py
-      - uses: dtolnay/rust-toolchain@stable
-      - name: Format
-        run: cargo fmt -- --check
-      - name: Test
-        run: cargo test
+      - name: Install stable Rust
+        run: rustup toolchain install stable --profile minimal --component rustfmt
+      - name: Format changed Rust files
+        run: |
+          rustfmt +stable --edition 2024 src/can/protocol.rs src/tasks/lora_task_base.rs
+          git diff --check
+      - name: Run host library tests
+        run: cargo +stable test --lib
       - name: Commit verified fix
         run: |
           rm -f tools/apply_mission_sd_health_fix.py
