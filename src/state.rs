@@ -67,6 +67,34 @@ impl Default for GnssTelemetry {
     }
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct GnssAbsoluteTime {
+    pub unix_seconds: u32,
+    pub milliseconds: u16,
+    pub observed_at_ms: u64,
+}
+
+impl GnssAbsoluteTime {
+    pub const fn fresh(self, now_ms: u64, maximum_age_ms: u64) -> bool {
+        now_ms >= self.observed_at_ms && now_ms - self.observed_at_ms <= maximum_age_ms
+    }
+
+    pub fn projected(self, now_ms: u64) -> Option<Self> {
+        if now_ms < self.observed_at_ms {
+            return None;
+        }
+        let elapsed_ms = now_ms - self.observed_at_ms;
+        let total_ms = u64::from(self.milliseconds).checked_add(elapsed_ms)?;
+        let seconds_add = total_ms / 1_000;
+        let unix_seconds = u64::from(self.unix_seconds).checked_add(seconds_add)?;
+        Some(Self {
+            unix_seconds: u32::try_from(unix_seconds).ok()?,
+            milliseconds: (total_ms % 1_000) as u16,
+            observed_at_ms: now_ms,
+        })
+    }
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct CanTxRequest {
     pub message: CanTxMessage,
@@ -95,6 +123,8 @@ pub static MISSION_LINK_FALLBACK_SEQUENCE: AtomicU8 = AtomicU8::new(0);
 pub static MISSION_STATUS_INVALID_AT_MS: AtomicU32 = AtomicU32::new(0);
 pub static GNSS_TELEMETRY: Mutex<CriticalSectionRawMutex, GnssTelemetry> =
     Mutex::new(GnssTelemetry::new());
+pub static GNSS_ABSOLUTE_TIME: Mutex<CriticalSectionRawMutex, Option<GnssAbsoluteTime>> =
+    Mutex::new(None);
 pub static GNSS_CHANNEL: Channel<CriticalSectionRawMutex, GnssPacket, 5> = Channel::new();
 pub static GNSS_CMD_CHANNEL: Channel<CriticalSectionRawMutex, GnssCommand, 2> = Channel::new();
 pub static UPLINK_COMMAND_CHANNEL: Channel<CriticalSectionRawMutex, UplinkCommand, 8> =
