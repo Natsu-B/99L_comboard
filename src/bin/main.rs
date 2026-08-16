@@ -14,14 +14,14 @@ use c99l_comboard::tasks::lora_timing_report_task;
 use c99l_comboard::{
     state::{
         CAN_HEALTH, CAN_REC, CAN_RX_ERROR_COUNT, CAN_RX_SUCCESS_COUNT, CAN_TEC, CAN_TX_ERROR_COUNT,
-        CAN_TX_SUCCESS_COUNT, GNSS_CHANNEL_DROP_COUNT, GNSS_RX_ERROR_COUNT,
+        CAN_TX_SUCCESS_COUNT, GNSS_CHANNEL_DROP_COUNT, GNSS_CMD_CHANNEL, GNSS_RX_ERROR_COUNT,
         GNSS_SETTING_ERROR_COUNT, GNSS_TELEMETRY, HAS_UNFLUSHED_DATA, IS_CAN_ERROR, LOGGING_ACTIVE,
         LOGGING_REQUESTED, LORA_AUX_TIMEOUT_COUNT, LORA_COMMAND_DROP_COUNT,
         LORA_EMERGENCY_RESULT_DROP_COUNT, LORA_GROUND_TIME_REQUEST_DROP_COUNT,
         LORA_GROUND_TIME_REQUEST_DUPLICATE_COUNT, LORA_PERIODIC_MISSED_SLOT_COUNT,
         LORA_RX_BYTE_COUNT, LORA_RX_ERROR_COUNT, LORA_RX_SUCCESS_COUNT, LORA_TX_ERROR_COUNT,
         LORA_TX_QUEUE_DROP_COUNT, LORA_TX_SUCCESS_COUNT, RAW_CAN_LOG_DROPPED_COUNT,
-        SD_DROPPED_ROW_COUNT, SD_HAS_ERROR, SD_WRITE_ERROR_COUNT,
+        SD_DROPPED_ROW_COUNT, SD_HAS_ERROR, SD_WRITE_ERROR_COUNT, GnssCommand,
     },
     tasks::{
         SdTimeSource, SdVolumeManager, can_communication_task, command_process_task,
@@ -146,6 +146,8 @@ async fn main(spawner0: Spawner) -> ! {
     }
 
     spawner0.spawn(gnss_manager_task(uart1, gnss_en).unwrap());
+    // GNSSは打ち上げ前から位置を取得できるよう、起動時に自動で有効化する。
+    GNSS_CMD_CHANNEL.send(GnssCommand::TurnOn).await;
     // Keep blocking SD traffic off the core reserved for LoRa and optional CAN tasks.
     spawner0.spawn(sd_write_task(volume_mgr, sd_logging_led).unwrap());
     #[cfg(feature = "lora-timing-debug")]
