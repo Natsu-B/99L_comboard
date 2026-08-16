@@ -1,0 +1,19 @@
+name: Validate GNSS absolute time main
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - .github/workflows/validate-gnss-absolute-time-main.yml
+
+jobs:
+  host:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install stable Rust
+        run: rustup toolchain install stable --profile minimal --component rustfmt
+      - name: Check formatting
+        run: cargo +stable fmt --all -- --check
+      - name: Run host library tests
+        run: cargo +stable test --lib
