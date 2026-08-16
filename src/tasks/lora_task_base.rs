@@ -633,6 +633,7 @@ async fn periodic_packet(
                 east: gnss.east,
                 north: gnss.north,
                 height: gnss.height,
+                display_roll: kinematics.map_or(0x8004, |value| value.roll),
             })
         }
         MissionState::LiftoffDetection | MissionState::EngineBurn | MissionState::Control => {
@@ -1094,7 +1095,7 @@ pub async fn lora_rx_task(mut rx: UartRx<'static, Async>) {
                                     UplinkCommand::LiftoffDetectionEmergency { transaction_id } => {
                                         CAN_SAFETY_TX_CHANNEL
                                             .send(CanTxRequest {
-                                                message: CanTxMessage::LiftoffEmergencyStop {
+                                                message: CanTxMessage::LiftoffDetectionEmergencyStop {
                                                     transaction_id,
                                                 },
                                             })
