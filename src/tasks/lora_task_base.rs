@@ -40,16 +40,15 @@ use crate::{
     },
     state::{
         CAN_CACHE, CAN_FALLBACK_HEALTH, CAN_SAFETY_TX_CHANNEL, CAN_TX_CHANNEL,
-        COMMAND_RESULT_LORA_CHANNEL, COMMAND_TRACKER, CONTROL_ROLL_LORA_SIGNAL,
-        CanTxRequest, EMERGENCY_RESULT_LORA_CHANNEL, GNSS_CMD_CHANNEL, GNSS_TELEMETRY,
+        COMMAND_RESULT_LORA_CHANNEL, COMMAND_TRACKER, CONTROL_ROLL_LORA_SIGNAL, CanTxRequest,
+        EMERGENCY_RESULT_LORA_CHANNEL, GNSS_CMD_CHANNEL, GNSS_TELEMETRY,
         GROUND_TIME_REQUEST_LORA_CHANNEL, GnssCommand, GnssReceiverState, HAS_UNFLUSHED_DATA,
         IS_CAN_ERROR, LOGGING_ACTIVE, LOGGING_REQUESTED, LORA_AUX_TIMEOUT_COUNT,
         LORA_COMMAND_DROP_COUNT, LORA_PERIODIC_MISSED_SLOT_COUNT, LORA_RX_BYTE_COUNT,
-        LORA_RX_ERROR_COUNT, LORA_RX_SUCCESS_COUNT, LORA_TX_ERROR_COUNT,
-        LORA_TX_QUEUE_DROP_COUNT, LORA_TX_SUCCESS_COUNT, MISSION_LINK_FALLBACK_SEQUENCE,
-        MISSION_STATUS_INVALID_AT_MS, RECOVERY_ASSEMBLER, RECOVERY_BEACON_ACTIVE,
-        RECOVERY_LORA_CHANNEL, RECOVERY_SESSION, SD_FLUSH_SIGNAL, SD_HAS_ERROR,
-        UPLINK_COMMAND_CHANNEL,
+        LORA_RX_ERROR_COUNT, LORA_RX_SUCCESS_COUNT, LORA_TX_ERROR_COUNT, LORA_TX_QUEUE_DROP_COUNT,
+        LORA_TX_SUCCESS_COUNT, MISSION_LINK_FALLBACK_SEQUENCE, MISSION_STATUS_INVALID_AT_MS,
+        RECOVERY_ASSEMBLER, RECOVERY_BEACON_ACTIVE, RECOVERY_LORA_CHANNEL, RECOVERY_SESSION,
+        SD_FLUSH_SIGNAL, SD_HAS_ERROR, UPLINK_COMMAND_CHANNEL,
     },
 };
 
@@ -460,7 +459,8 @@ fn mission_link_fallback_packet_with_health(
     let mission_ever = mission_received.is_some();
     let periodic_ever = any_periodic_received.is_some();
     let invalid_at = MISSION_STATUS_INVALID_AT_MS.load(Ordering::Relaxed) as u64;
-    let invalid_is_latest = invalid_at != 0 && mission_received.is_none_or(|valid_at| invalid_at > valid_at);
+    let invalid_is_latest =
+        invalid_at != 0 && mission_received.is_none_or(|valid_at| invalid_at > valid_at);
     let primary_loss_reason = fallback_primary_loss_reason(
         can_health,
         invalid_is_latest,
@@ -485,7 +485,10 @@ fn mission_link_fallback_packet_with_health(
     flags |= u16::from(mission_ever) << 12;
     flags |= fallback_can_status_flags(can_health);
 
-    let last_state = cache.mission_status.value().map_or(0xff, |status| status.state as u8);
+    let last_state = cache
+        .mission_status
+        .value()
+        .map_or(0xff, |status| status.state as u8);
     let power = cache.power_time.value();
     ApplicationPacket::MissionLinkFallbackTelemetry(MissionLinkFallbackTelemetry {
         sequence: MISSION_LINK_FALLBACK_SEQUENCE.fetch_add(1, Ordering::Relaxed),
@@ -748,7 +751,7 @@ fn map_command_receive_status(
     if let Some(power) = power {
         status |= u32::from(power.logic_voltage <= 240) << 8;
         status |= u32::from(power.motor_voltage <= 240) << 9;
-        status |= u32::from(power.flags & (1 << 2) != 0) << 10;
+        status |= u32::from(power.flags & (1 << 3) != 0) << 10;
         status |= u32::from(power.flags & (1 << 0) != 0) << 13;
         // PowerTime bit5/6は最新Vaultでreserved。Flash backup bitへ転用しない。
     }

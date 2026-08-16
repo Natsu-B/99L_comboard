@@ -571,7 +571,7 @@ impl CanRxMessage {
             }
             CAN_ID_POWER_TIME => {
                 require_dlc(id, data, 8)?;
-                require_reserved_zero(id, 7, data[7], 0x78)?;
+                require_reserved_zero(id, 7, data[7], 0x70)?;
                 Ok(Self::PowerTime(PowerTimeTelemetry {
                     sequence: data[0],
                     logic_voltage: data[1],
@@ -939,7 +939,7 @@ mod tests {
                 motor_voltage: 0xdc,
                 descent_elapsed: 0xfffa,
                 recovery_elapsed: 0x000c,
-                flags: 0x85,
+                flags: 0x89,
             }))
         );
         assert_eq!(
@@ -1063,7 +1063,7 @@ mod tests {
             Err(CanDecodeError::InvalidField { .. })
         ));
         assert!(matches!(
-            CanRxMessage::decode_standard(CAN_ID_POWER_TIME, &[0, 0, 0, 0, 0, 0, 0, 0x08]),
+            CanRxMessage::decode_standard(CAN_ID_POWER_TIME, &[0, 0, 0, 0, 0, 0, 0, 0x10]),
             Err(CanDecodeError::InvalidField { .. })
         ));
         assert!(matches!(
