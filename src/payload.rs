@@ -61,6 +61,8 @@ pub struct CommandReceiveTelemetry {
     pub east: u16,
     pub north: u16,
     pub height: u16,
+    // COMMANDRECEIVE表示専用。0x100 rollをそのまま運ぶ。
+    pub display_roll: u16,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -238,6 +240,7 @@ fn encode_command_receive(
     writer.write(value.east as u32, 16)?;
     writer.write(value.north as u32, 16)?;
     writer.write(value.height as u32, 9)?;
+    writer.write(value.display_roll as u32, 16)?;
     writer.write(0, 4)
 }
 
@@ -528,6 +531,7 @@ mod tests {
             east: 0x8001,
             north: 0x8001,
             height: 0x1f1,
+            display_roll: 60,
         })
         .encode()
         .unwrap();
