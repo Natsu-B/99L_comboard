@@ -1095,7 +1095,7 @@ pub async fn lora_rx_task(mut rx: UartRx<'static, Async>) {
                                     UplinkCommand::LiftoffDetectionEmergency { transaction_id } => {
                                         CAN_SAFETY_TX_CHANNEL
                                             .send(CanTxRequest {
-                                                message: CanTxMessage::LiftoffDetectionEmergencyStop {
+                                                message: CanTxMessage::LiftoffEmergencyStop {
                                                     transaction_id,
                                                 },
                                             })
