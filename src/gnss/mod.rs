@@ -2,6 +2,7 @@ pub mod nmea;
 #[cfg(target_arch = "xtensa")]
 pub mod settings;
 pub mod telemetry;
+pub mod time;
 
 pub use nmea::{
     FixQuality, GgaData, GgaParseError, GstData, NmeaParseError, RmcData, UtcTime, parse_gga,
@@ -12,3 +13,4 @@ pub use settings::{
     DYNAMIC_MODEL_AIRBORNE_4G, GLL_DELETE, GSA_DELETE, GST_ENABLE_UART1, GSV_DELETE, MEAS_RATE,
     QZSS_L1S_ENABLE, UART_BAUD, VTG_DELETE, gnss_setting,
 };
+pub use time::{GnssDateTime, GnssTimeParseError, parse_rmc_datetime};

@@ -25,7 +25,7 @@ use c99l_comboard::{
     },
     tasks::{
         SdTimeSource, SdVolumeManager, can_communication_task, command_process_task,
-        gnss_manager_task, lora_rx_task, lora_tx_task, parse_gnss_task,
+        gnss_manager_task, gnss_time_response_task, lora_rx_task, lora_tx_task, parse_gnss_task,
         recovery_power_cache_task, sd_write_task,
     },
 };
@@ -189,6 +189,7 @@ async fn main(spawner0: Spawner) -> ! {
                 spawner.spawn(command_process_task().unwrap());
                 spawner.spawn(recovery_power_cache_task().unwrap());
                 spawner.spawn(parse_gnss_task().unwrap());
+                spawner.spawn(gnss_time_response_task().unwrap());
                 spawner.spawn(lora_rx_task(lora_uart_rx).unwrap());
                 spawner.spawn(lora_tx_task(lora_uart_tx, aux_pin).unwrap());
             });

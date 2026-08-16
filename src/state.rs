@@ -1,4 +1,4 @@
-use core::sync::atomic::{AtomicBool, AtomicU8, AtomicU32};
+use core::sync::atomic::{AtomicBool, AtomicU8, AtomicU16, AtomicU32};
 
 use embassy_sync::{
     blocking_mutex::raw::CriticalSectionRawMutex, channel::Channel, mutex::Mutex, signal::Signal,
@@ -89,7 +89,6 @@ pub static RECOVERY_ASSEMBLER: Mutex<CriticalSectionRawMutex, RecoveryAssembler>
     Mutex::new(RecoveryAssembler::new());
 pub static RECOVERY_BEACON_ACTIVE: AtomicBool = AtomicBool::new(false);
 pub static RECOVERY_ENTER_SENT: AtomicBool = AtomicBool::new(false);
-pub static RECOVERY_MODE_CHANGE_PENDING: AtomicBool = AtomicBool::new(false);
 pub static MISSION_LINK_FALLBACK_SEQUENCE: AtomicU8 = AtomicU8::new(0);
 // 0は「invalid MissionStatus未観測」。boot直後0 msとの衝突は診断上のみで安全動作へ影響しない。
 pub static MISSION_STATUS_INVALID_AT_MS: AtomicU32 = AtomicU32::new(0);
@@ -97,6 +96,12 @@ pub static GNSS_TELEMETRY: Mutex<CriticalSectionRawMutex, GnssTelemetry> =
     Mutex::new(GnssTelemetry::new());
 pub static GNSS_CHANNEL: Channel<CriticalSectionRawMutex, GnssPacket, 5> = Channel::new();
 pub static GNSS_CMD_CHANNEL: Channel<CriticalSectionRawMutex, GnssCommand, 2> = Channel::new();
+// GNSS absolute timeはposition fixとは独立して保持する。writerはRMC parserだけ、
+// readerはGNSS TimeResponse taskだけなので、validをrelease/acquireのpublish bitとして使う。
+pub static GNSS_TIME_VALID: AtomicBool = AtomicBool::new(false);
+pub static GNSS_TIME_UNIX_SECONDS: AtomicU32 = AtomicU32::new(0);
+pub static GNSS_TIME_MILLISECONDS: AtomicU16 = AtomicU16::new(0);
+pub static GNSS_TIME_UPDATED_AT_MS: AtomicU32 = AtomicU32::new(0);
 pub static UPLINK_COMMAND_CHANNEL: Channel<CriticalSectionRawMutex, UplinkCommand, 8> =
     Channel::new();
 pub(crate) static EMERGENCY_RESULT_LORA_CHANNEL: Channel<

@@ -10,8 +10,9 @@ use esp_hal::{
 use esp_println::println;
 
 use crate::{
+    can::protocol::{CanTxMessage, TimeSource},
     gnss::{
-        FixQuality, gnss_setting, parse_gga,
+        FixQuality, gnss_setting, parse_gga, parse_rmc_datetime,
         telemetry::{
             GNSS_COORDINATE_INVALID, GNSS_COORDINATE_NO_FIX, GNSS_COORDINATE_RECEIVER_ERROR,
             GNSS_COORDINATE_STALE, GNSS_COORDINATE_UNAVAILABLE, GNSS_HEIGHT_INVALID,
@@ -20,12 +21,15 @@ use crate::{
         },
     },
     state::{
-        GNSS_CHANNEL, GNSS_CHANNEL_DROP_COUNT, GNSS_CMD_CHANNEL, GNSS_RX_ERROR_COUNT,
-        GNSS_SETTING_ERROR_COUNT, GNSS_TELEMETRY, GnssCommand, GnssReceiverState,
+        CAN_CACHE, CAN_TX_CHANNEL, GNSS_CHANNEL, GNSS_CHANNEL_DROP_COUNT, GNSS_CMD_CHANNEL,
+        GNSS_RX_ERROR_COUNT, GNSS_SETTING_ERROR_COUNT, GNSS_TELEMETRY, GNSS_TIME_MILLISECONDS,
+        GNSS_TIME_UNIX_SECONDS, GNSS_TIME_UPDATED_AT_MS, GNSS_TIME_VALID, CanTxRequest,
+        GnssCommand, GnssReceiverState,
     },
 };
 
 const GNSS_STALE_TIMEOUT_MS: u64 = 3_000;
+const GNSS_TIME_RESPONSE_POLL_MS: u64 = 100;
 
 async fn set_receiver_state(state: GnssReceiverState) {
     let mut telemetry = GNSS_TELEMETRY.lock().await;
@@ -106,6 +110,7 @@ pub async fn gnss_manager_task(mut uart: Uart<'static, Async>, mut gnss_en: Outp
                     if is_on {
                         continue;
                     }
+                    GNSS_TIME_VALID.store(false, Ordering::Release);
                     set_receiver_state(GnssReceiverState::Starting).await;
                     gnss_en.set_high();
                     let config_9600 = UartConfig::default().with_baudrate(9_600);
@@ -138,6 +143,7 @@ pub async fn gnss_manager_task(mut uart: Uart<'static, Async>, mut gnss_en: Outp
                         ),
                         Err(error) => {
                             GNSS_SETTING_ERROR_COUNT.fetch_add(1, Ordering::Relaxed);
+                            GNSS_TIME_VALID.store(false, Ordering::Release);
                             println!("GNSS setting failed: {:?}", error);
                             set_receiver_state(GnssReceiverState::ConfigurationFailed).await;
                             gnss_en.set_low();
@@ -150,6 +156,7 @@ pub async fn gnss_manager_task(mut uart: Uart<'static, Async>, mut gnss_en: Outp
                         .is_err()
                     {
                         GNSS_SETTING_ERROR_COUNT.fetch_add(1, Ordering::Relaxed);
+                        GNSS_TIME_VALID.store(false, Ordering::Release);
                         set_receiver_state(GnssReceiverState::ConfigurationFailed).await;
                         gnss_en.set_low();
                         continue;
@@ -159,6 +166,7 @@ pub async fn gnss_manager_task(mut uart: Uart<'static, Async>, mut gnss_en: Outp
                 GnssCommand::TurnOff => {
                     gnss_en.set_low();
                     is_on = false;
+                    GNSS_TIME_VALID.store(false, Ordering::Release);
                     {
                         let mut telemetry = GNSS_TELEMETRY.lock().await;
                         telemetry.state = GnssReceiverState::Off;
@@ -174,8 +182,19 @@ pub async fn gnss_manager_task(mut uart: Uart<'static, Async>, mut gnss_en: Outp
     }
 }
 
+fn is_sentence(sentence: &[u8], suffix: &[u8; 3]) -> bool {
+    sentence
+        .iter()
+        .position(|value| *value == b',')
+        .is_some_and(|comma| comma >= 4 && &sentence[comma - 3..comma] == suffix)
+}
+
 fn is_gga(sentence: &[u8]) -> bool {
-    sentence.windows(3).any(|window| window == b"GGA")
+    is_sentence(sentence, b"GGA")
+}
+
+fn is_rmc(sentence: &[u8]) -> bool {
+    is_sentence(sentence, b"RMC")
 }
 
 #[embassy_executor::task]
@@ -190,6 +209,17 @@ pub async fn parse_gnss_task() {
                         | GnssReceiverState::Starting
                         | GnssReceiverState::ConfigurationFailed
                 ) {
+                    continue;
+                }
+
+                if is_rmc(&sentence) {
+                    if let Ok(time) = parse_rmc_datetime(sentence.as_slice()) {
+                        let now_ms = Instant::now().as_millis();
+                        GNSS_TIME_UNIX_SECONDS.store(time.unix_seconds, Ordering::Relaxed);
+                        GNSS_TIME_MILLISECONDS.store(time.milliseconds, Ordering::Relaxed);
+                        GNSS_TIME_UPDATED_AT_MS.store(now_ms as u32, Ordering::Relaxed);
+                        GNSS_TIME_VALID.store(true, Ordering::Release);
+                    }
                     continue;
                 }
                 if !is_gga(&sentence) {
@@ -277,7 +307,66 @@ pub async fn parse_gnss_task() {
                     }
                     _ => {}
                 }
+                if GNSS_TIME_VALID.load(Ordering::Acquire) {
+                    let updated = u64::from(GNSS_TIME_UPDATED_AT_MS.load(Ordering::Relaxed));
+                    if now_ms.saturating_sub(updated) >= GNSS_STALE_TIMEOUT_MS {
+                        GNSS_TIME_VALID.store(false, Ordering::Release);
+                    }
+                }
             }
+        }
+    }
+}
+
+#[embassy_executor::task]
+pub async fn gnss_time_response_task() {
+    let mut ticker = Ticker::every(Duration::from_millis(GNSS_TIME_RESPONSE_POLL_MS));
+    let mut last_response: Option<(u8, u64)> = None;
+    loop {
+        ticker.next().await;
+        let request = {
+            let cache = CAN_CACHE.lock().await;
+            cache
+                .time_request
+                .value()
+                .zip(cache.time_request.received_at_ms())
+        };
+        let Some((request_id, request_received_at_ms)) = request else {
+            continue;
+        };
+        if last_response == Some((request_id, request_received_at_ms)) {
+            continue;
+        }
+        if !GNSS_TIME_VALID.load(Ordering::Acquire) {
+            continue;
+        }
+
+        let now_ms = Instant::now().as_millis();
+        let updated_at_ms = u64::from(GNSS_TIME_UPDATED_AT_MS.load(Ordering::Relaxed));
+        let age_ms = now_ms.saturating_sub(updated_at_ms);
+        if age_ms > GNSS_STALE_TIMEOUT_MS {
+            GNSS_TIME_VALID.store(false, Ordering::Release);
+            continue;
+        }
+        let base_seconds = GNSS_TIME_UNIX_SECONDS.load(Ordering::Relaxed);
+        let base_milliseconds = u64::from(GNSS_TIME_MILLISECONDS.load(Ordering::Relaxed));
+        let total_milliseconds = base_milliseconds + age_ms;
+        let Some(unix_seconds) = base_seconds.checked_add((total_milliseconds / 1_000) as u32)
+        else {
+            GNSS_TIME_VALID.store(false, Ordering::Release);
+            continue;
+        };
+        let milliseconds = (total_milliseconds % 1_000) as u16;
+        let response = CanTxRequest {
+            message: CanTxMessage::TimeResponse {
+                request_id,
+                source: TimeSource::Gnss,
+                unix_seconds,
+                milliseconds,
+            },
+        };
+        if CAN_TX_CHANNEL.try_send(response).is_ok() {
+            last_response = Some((request_id, request_received_at_ms));
         }
     }
 }
