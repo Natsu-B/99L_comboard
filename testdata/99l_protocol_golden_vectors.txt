@@ -1,5 +1,5 @@
 # 99L共通wire golden vectors。値は空白なし16進数とする。
-# Vault source commit: cbf6e6128f963a36a94941a3d9770988a6027356
+# Vault source commit: 8632306970b7935940518395ffcb716d9d82b58e
 CAN_001=2A
 CAN_002=2B
 CAN_008=1234452301560400
