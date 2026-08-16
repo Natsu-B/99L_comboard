@@ -2,6 +2,11 @@ use crate::can::protocol::{GenericCommandRequest, TimeSource};
 
 pub const UPLINK_FRAME_LENGTH: usize = 11;
 const UPLINK_HEADER: u8 = 0x55;
+const PARA_FREE: u8 = 0x20;
+const PARA_HOLD: u8 = 0x21;
+const PARA_MOVE_RELATIVE: u8 = 0x22;
+const SET_PARA_OPEN: u8 = 0x23;
+const SET_PARA_CLOSE: u8 = 0x24;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 #[repr(u8)]
@@ -57,6 +62,13 @@ pub enum UplinkDecodeError {
     InvalidField,
 }
 
+fn is_deprecated_parachute_command(command: u8) -> bool {
+    matches!(
+        command,
+        PARA_FREE | PARA_HOLD | PARA_MOVE_RELATIVE | SET_PARA_OPEN | SET_PARA_CLOSE
+    )
+}
+
 pub fn decode_uplink(
     bytes: &[u8; UPLINK_FRAME_LENGTH],
 ) -> Result<UplinkCommand, UplinkDecodeError> {
@@ -73,11 +85,16 @@ pub fn decode_uplink(
     let mut args = [0; 6];
     args.copy_from_slice(&bytes[4..10]);
     match kind {
-        UplinkKind::MissionGeneric => Ok(UplinkCommand::MissionGeneric(GenericCommandRequest {
-            transaction_id: bytes[2],
-            command: bytes[3],
-            args,
-        })),
+        UplinkKind::MissionGeneric => {
+            if is_deprecated_parachute_command(bytes[3]) {
+                return Err(UplinkDecodeError::InvalidField);
+            }
+            Ok(UplinkCommand::MissionGeneric(GenericCommandRequest {
+                transaction_id: bytes[2],
+                command: bytes[3],
+                args,
+            }))
+        }
         UplinkKind::ActuatorEmergency | UplinkKind::LiftoffDetectionEmergency => {
             if bytes[3..10].iter().any(|byte| *byte != 0) {
                 return Err(UplinkDecodeError::InvalidField);
@@ -218,6 +235,34 @@ mod tests {
                 milliseconds: 999
             })
         ));
+    }
+
+    #[test]
+    fn deprecated_parachute_commands_are_rejected() {
+        for command in [
+            PARA_FREE,
+            PARA_HOLD,
+            PARA_MOVE_RELATIVE,
+            SET_PARA_OPEN,
+            SET_PARA_CLOSE,
+        ] {
+            let mut bytes = as_frame(golden("UPLINK_GENERIC"));
+            bytes[3] = command;
+            bytes[4..10].fill(0);
+            bytes[10] = xor_checksum(&bytes[..10]);
+            assert_eq!(decode_uplink(&bytes), Err(UplinkDecodeError::InvalidField));
+        }
+
+        for command in [0x25, 0x26] {
+            let mut bytes = as_frame(golden("UPLINK_GENERIC"));
+            bytes[3] = command;
+            bytes[4..10].fill(0);
+            bytes[10] = xor_checksum(&bytes[..10]);
+            assert!(matches!(
+                decode_uplink(&bytes),
+                Ok(UplinkCommand::MissionGeneric(GenericCommandRequest { command: decoded, .. })) if decoded == command
+            ));
+        }
     }
 
     #[test]
