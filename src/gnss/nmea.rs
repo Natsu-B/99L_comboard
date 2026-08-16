@@ -147,7 +147,7 @@ fn parse_utc_hms_millis(bytes: &[u8]) -> Result<(u8, u8, u8, u16), GgaParseError
 }
 
 const fn leap_year(year: u16) -> bool {
-    year.is_multiple_of(4) && (!year.is_multiple_of(100) || year.is_multiple_of(400))
+    year % 4 == 0 && (year % 100 != 0 || year % 400 == 0)
 }
 
 const fn days_in_month(year: u16, month: u8) -> Option<u8> {
@@ -180,12 +180,7 @@ fn parse_rmc_date(bytes: &[u8]) -> Result<UtcDate, GgaParseError> {
     Ok(UtcDate { year, month, day })
 }
 
-fn unix_seconds(
-    date: UtcDate,
-    hour: u8,
-    minute: u8,
-    second: u8,
-) -> Result<u32, GgaParseError> {
+fn unix_seconds(date: UtcDate, hour: u8, minute: u8, second: u8) -> Result<u32, GgaParseError> {
     if date.year < 1970 {
         return Err(GgaParseError::ParseError);
     }
@@ -260,7 +255,14 @@ mod validation_tests {
     fn rmc_datetime_converts_to_unix_time() {
         let rmc = sentence("GNRMC,123519.250,A,4807.038,N,01131.000,E,0.0,0.0,230394,,,A");
         let parsed = parse_rmc_datetime(rmc.as_bytes()).unwrap();
-        assert_eq!(parsed.date, UtcDate { year: 1994, month: 3, day: 23 });
+        assert_eq!(
+            parsed.date,
+            UtcDate {
+                year: 1994,
+                month: 3,
+                day: 23
+            }
+        );
         assert_eq!((parsed.hour, parsed.minute, parsed.second), (12, 35, 19));
         assert_eq!(parsed.milliseconds, 250);
         assert_eq!(parsed.unix_seconds, 764_426_119);
