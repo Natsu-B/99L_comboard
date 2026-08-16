@@ -20,7 +20,16 @@ CAN、LoRa、GNSS、SDはowner task以外から直接操作せず、bounded chan
 
 ## Build / flash / run
 
-ESP Rust toolchainとXtensa GCCが必要です。
+Nixが必要です。初回だけESP Rust toolchainを導入し、shellへ入り直します。
+
+```sh
+nix develop
+espup install
+exit
+nix develop
+```
+
+以降のbuildと書き込みは`nix develop`内で実行します。
 
 ```sh
 cargo fmt --all -- --check
@@ -28,27 +37,27 @@ cargo check
 cargo test
 cargo clippy --all-targets -- -D warnings
 
-PATH=/path/to/xtensa-esp-elf/bin:$PATH \
-  cargo build --release --features firmware \
+cargo build --release --features firmware \
   --target xtensa-esp32s3-none-elf -Z build-std=core
 ```
 
 LoRa timingの実機診断では`lora-timing-debug`を追加します。10送信ごとにsource別件数、request/queue/AUX/UART/物理送信/idle、missed slotとtimestamp異常を`LORA_TIMING`へ出力します。
 
 ```sh
-PATH=/path/to/xtensa-esp-elf/bin:$PATH \
-  cargo build --release --features firmware,lora-timing-debug \
+cargo build --release --features firmware,lora-timing-debug \
   --target xtensa-esp32s3-none-elf -Z build-std=core
 ```
 
-接続先をVID/PID/serialで確認してから、生成したELFを`espflash`でESP32-S3へ書き込みます。port番号を推測して指定しないでください。
+接続先をserialで確認してから、生成したELFを`espflash`でESP32-S3へ書き込みます。`flake.nix`がbuild先を`$CARGO_TARGET_DIR`へ変更するため、repository内の`target/`ではなくこの変数を使います。port番号を推測して指定しないでください。
 
 ```sh
-espflash flash --chip esp32s3 --port /dev/ttyACM<N> \
-  target/xtensa-esp32s3-none-elf/release/c99l_comboard
+ls -l /dev/serial/by-id/
+espflash flash --chip esp32s3 \
+  --port /dev/serial/by-id/<Espressifのdevice名> \
+  "$CARGO_TARGET_DIR/xtensa-esp32s3-none-elf/release/c99l_comboard"
 ```
 
-2026-08-14の3基板実機試験では`/dev/ttyACM0`を使用しました。portは環境ごとに変わるため、通常はUSB identityを照合してから指定してください。実測結果は[docs/hardware_test_results.md](docs/hardware_test_results.md)に記録しています。
+`/dev/ttyACM<N>`は接続順で変わるため、`/dev/serial/by-id/`の安定した名前を使用してください。実測結果は[docs/hardware_test_results.md](docs/hardware_test_results.md)に記録しています。
 
 ## Protocol
 
