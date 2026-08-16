@@ -11,7 +11,7 @@ use esp_println::println;
 
 use crate::{
     gnss::{
-        FixQuality, gnss_setting, parse_gga,
+        FixQuality, gnss_setting, parse_gga, parse_rmc_datetime,
         telemetry::{
             GNSS_COORDINATE_INVALID, GNSS_COORDINATE_NO_FIX, GNSS_COORDINATE_RECEIVER_ERROR,
             GNSS_COORDINATE_STALE, GNSS_COORDINATE_UNAVAILABLE, GNSS_HEIGHT_INVALID,
@@ -20,12 +20,17 @@ use crate::{
         },
     },
     state::{
-        GNSS_CHANNEL, GNSS_CHANNEL_DROP_COUNT, GNSS_CMD_CHANNEL, GNSS_RX_ERROR_COUNT,
-        GNSS_SETTING_ERROR_COUNT, GNSS_TELEMETRY, GnssCommand, GnssReceiverState,
+        GNSS_ABSOLUTE_TIME, GNSS_CHANNEL, GNSS_CHANNEL_DROP_COUNT, GNSS_CMD_CHANNEL,
+        GNSS_RX_ERROR_COUNT, GNSS_SETTING_ERROR_COUNT, GNSS_TELEMETRY, GnssAbsoluteTime,
+        GnssCommand, GnssReceiverState,
     },
 };
 
 const GNSS_STALE_TIMEOUT_MS: u64 = 3_000;
+
+async fn clear_absolute_time() {
+    *GNSS_ABSOLUTE_TIME.lock().await = None;
+}
 
 async fn set_receiver_state(state: GnssReceiverState) {
     let mut telemetry = GNSS_TELEMETRY.lock().await;
@@ -106,12 +111,14 @@ pub async fn gnss_manager_task(mut uart: Uart<'static, Async>, mut gnss_en: Outp
                     if is_on {
                         continue;
                     }
+                    clear_absolute_time().await;
                     set_receiver_state(GnssReceiverState::Starting).await;
                     gnss_en.set_high();
                     let config_9600 = UartConfig::default().with_baudrate(9_600);
                     if uart.apply_config(&config_9600).is_err() {
                         GNSS_SETTING_ERROR_COUNT.fetch_add(1, Ordering::Relaxed);
                         set_receiver_state(GnssReceiverState::ConfigurationFailed).await;
+                        clear_absolute_time().await;
                         gnss_en.set_low();
                         continue;
                     }
@@ -140,6 +147,7 @@ pub async fn gnss_manager_task(mut uart: Uart<'static, Async>, mut gnss_en: Outp
                             GNSS_SETTING_ERROR_COUNT.fetch_add(1, Ordering::Relaxed);
                             println!("GNSS setting failed: {:?}", error);
                             set_receiver_state(GnssReceiverState::ConfigurationFailed).await;
+                            clear_absolute_time().await;
                             gnss_en.set_low();
                             continue;
                         }
@@ -151,6 +159,7 @@ pub async fn gnss_manager_task(mut uart: Uart<'static, Async>, mut gnss_en: Outp
                     {
                         GNSS_SETTING_ERROR_COUNT.fetch_add(1, Ordering::Relaxed);
                         set_receiver_state(GnssReceiverState::ConfigurationFailed).await;
+                        clear_absolute_time().await;
                         gnss_en.set_low();
                         continue;
                     }
@@ -159,6 +168,7 @@ pub async fn gnss_manager_task(mut uart: Uart<'static, Async>, mut gnss_en: Outp
                 GnssCommand::TurnOff => {
                     gnss_en.set_low();
                     is_on = false;
+                    clear_absolute_time().await;
                     {
                         let mut telemetry = GNSS_TELEMETRY.lock().await;
                         telemetry.state = GnssReceiverState::Off;
@@ -178,6 +188,10 @@ fn is_gga(sentence: &[u8]) -> bool {
     sentence.windows(3).any(|window| window == b"GGA")
 }
 
+fn is_rmc(sentence: &[u8]) -> bool {
+    sentence.windows(3).any(|window| window == b"RMC")
+}
+
 #[embassy_executor::task]
 pub async fn parse_gnss_task() {
     let mut stale_ticker = Ticker::every(Duration::from_secs(1));
@@ -192,10 +206,24 @@ pub async fn parse_gnss_task() {
                 ) {
                     continue;
                 }
+
+                let now_ms = Instant::now().as_millis();
+                if is_rmc(&sentence) {
+                    // RMCのUTC date/timeはposition fixとは独立して扱う。
+                    // status=Vでもdate/timeとchecksumが正しければ時刻sourceとして利用する。
+                    if let Ok(datetime) = parse_rmc_datetime(&sentence) {
+                        *GNSS_ABSOLUTE_TIME.lock().await = Some(GnssAbsoluteTime {
+                            unix_seconds: datetime.unix_seconds,
+                            milliseconds: datetime.milliseconds,
+                            observed_at_ms: now_ms,
+                        });
+                    }
+                    continue;
+                }
                 if !is_gga(&sentence) {
                     continue;
                 }
-                let now_ms = Instant::now().as_millis();
+
                 let parsed = parse_gga(sentence.as_slice());
                 let mut telemetry = GNSS_TELEMETRY.lock().await;
                 // parse中にTurnOffされた場合も、古いGGAでOffを上書きしない。
