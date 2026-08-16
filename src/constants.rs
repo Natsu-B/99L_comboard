@@ -1,5 +1,7 @@
 pub const BUF_SIZE: usize = 2048;
 pub const LORA_TRANSMIT_INTERVAL_MS: u64 = 500;
+pub const RECOVERY_POWER_FRESHNESS_MS: u64 = 30_000;
+pub const LOCAL_EXIT_RECOVERY_COMMAND: u8 = b'e';
 pub const LORA_RX_TX_GUARD_MS: u64 = 60;
 // 実機110送信すべてでflush後1〜3 us（平均2.1 us）にAUX Lowを観測した。
 // 15 msはLow開始を取りこぼさないための異常判定時間であり、送信後の固定待機ではない。

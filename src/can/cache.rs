@@ -49,6 +49,11 @@ impl<T: Copy> Latest<T> {
         self.received_at_ms = received_at_ms;
     }
 
+    pub fn clear(&mut self) {
+        self.value = None;
+        self.received_at_ms = 0;
+    }
+
     pub const fn value(self) -> Option<T> {
         self.value
     }
@@ -217,6 +222,10 @@ impl CanCache {
             self.event_flags_latched &= !flags;
         }
     }
+
+    pub fn clear_recovery_power_snapshot(&mut self) {
+        self.power_time.clear();
+    }
 }
 
 impl Default for CanCache {
@@ -300,6 +309,25 @@ mod tests {
             cache.airspeed.freshness(99, FRESHNESS_100_HZ_MS),
             Freshness::Stale
         );
+    }
+
+    #[test]
+    fn recovery_power_snapshot_can_be_reset_at_mode_entry() {
+        let mut cache = CanCache::new();
+        cache.update(
+            CanRxMessage::PowerTime(PowerTimeTelemetry {
+                sequence: 1,
+                logic_voltage: 10,
+                motor_voltage: 20,
+                descent_elapsed: 30,
+                recovery_elapsed: 40,
+                flags: 0,
+            }),
+            100,
+        );
+        cache.clear_recovery_power_snapshot();
+        assert_eq!(cache.power_time.value(), None);
+        assert_eq!(cache.power_time.received_at_ms(), None);
     }
 
     #[test]

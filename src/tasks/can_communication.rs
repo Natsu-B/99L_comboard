@@ -22,6 +22,7 @@ use crate::{
     },
     constants::{
         CAN_CONSECUTIVE_ERROR_THRESHOLD, CAN_HEALTH_MONITOR_INTERVAL_MS, CAN_TX_TIMEOUT_MS,
+        LOCAL_EXIT_RECOVERY_COMMAND,
     },
     lora_scheduler::{
         GroundTimeQueueAction, LoRaTxEnvelope, LoRaTxSource, ground_time_queue_action,
@@ -36,7 +37,8 @@ use crate::{
         LORA_GROUND_TIME_REQUEST_DROP_COUNT, LORA_GROUND_TIME_REQUEST_DUPLICATE_COUNT,
         LORA_TX_QUEUE_DROP_COUNT, MISSION_STATUS_INVALID_AT_MS, RAW_CAN_LOG_CHANNEL,
         RAW_CAN_LOG_DROPPED_COUNT, RECOVERY_ASSEMBLER, RECOVERY_BEACON_ACTIVE,
-        RECOVERY_ENTER_SENT, RECOVERY_LORA_CHANNEL, RECOVERY_SESSION, RawCanRecord,
+        RECOVERY_ENTER_SENT, RECOVERY_LORA_CHANNEL, RECOVERY_MODE_CHANGE_PENDING,
+        RECOVERY_SESSION, RawCanRecord,
     },
 };
 
@@ -419,6 +421,14 @@ async fn apply_received_message(
                 }
             }
             if let Some(result) = RECOVERY_SESSION.lock().await.apply_status(status) {
+                if result.command == LOCAL_EXIT_RECOVERY_COMMAND
+                    && result.phase == crate::can::protocol::CommandPhase::Completed
+                    && result.reason == crate::can::protocol::CommandReason::None
+                {
+                    RECOVERY_BEACON_ACTIVE.store(false, Ordering::Relaxed);
+                    RECOVERY_MODE_CHANGE_PENDING.store(true, Ordering::Relaxed);
+                    CONTROL_ROLL_LORA_SIGNAL.signal(());
+                }
                 queue_command_result(CommandResultPacket {
                     transaction_id: result.transaction_id,
                     command: result.command,
@@ -454,15 +464,15 @@ async fn apply_received_message(
     }
 }
 
-fn handle_recovery_mode_command(data: &[u8]) -> bool {
+fn handle_recovery_mode_command(data: &[u8]) -> Option<bool> {
     // Vault 04: ID 0x014 / DLC 3 / mode=1 / reason=0..3のみ有効。
     if data.len() != 3 || data[1] != 1 || data[2] > 3 {
-        return false;
+        return None;
     }
     // sequenceはu8 wrap可。同じEnterRecoveryBeaconの再受信はidempotent。
-    RECOVERY_BEACON_ACTIVE.store(true, Ordering::Relaxed);
+    let was_active = RECOVERY_BEACON_ACTIVE.swap(true, Ordering::Relaxed);
     RECOVERY_ENTER_SENT.store(true, Ordering::Relaxed);
-    true
+    Some(!was_active)
 }
 
 async fn handle_received_frame(frame: EspTwaiFrame, previous_time_request_id: &mut Option<u8>) {
@@ -487,9 +497,17 @@ async fn handle_received_frame(frame: EspTwaiFrame, previous_time_request_id: &m
     }
 
     if identifier == 0x014 {
-        if !handle_recovery_mode_command(frame.data()) {
-            CAN_RX_ERROR_COUNT.fetch_add(1, Ordering::Relaxed);
-            println!("invalid RecoveryModeCommand");
+        match handle_recovery_mode_command(frame.data()) {
+            Some(true) => {
+                CAN_CACHE.lock().await.clear_recovery_power_snapshot();
+                RECOVERY_MODE_CHANGE_PENDING.store(true, Ordering::Relaxed);
+                CONTROL_ROLL_LORA_SIGNAL.signal(());
+            }
+            Some(false) => {}
+            None => {
+                CAN_RX_ERROR_COUNT.fetch_add(1, Ordering::Relaxed);
+                println!("invalid RecoveryModeCommand");
+            }
         }
         return;
     }
@@ -691,11 +709,12 @@ mod tests {
     #[test]
     fn recovery_mode_command_requires_vault_layout() {
         RECOVERY_BEACON_ACTIVE.store(false, Ordering::Relaxed);
-        assert!(handle_recovery_mode_command(&[0x10, 1, 0]));
+        assert_eq!(handle_recovery_mode_command(&[0x10, 1, 0]), Some(true));
         assert!(RECOVERY_BEACON_ACTIVE.load(Ordering::Relaxed));
-        assert!(!handle_recovery_mode_command(&[0x10, 0, 0]));
-        assert!(!handle_recovery_mode_command(&[0x10, 1, 4]));
-        assert!(!handle_recovery_mode_command(&[0x10, 1]));
+        assert_eq!(handle_recovery_mode_command(&[0x11, 1, 2]), Some(false));
+        assert_eq!(handle_recovery_mode_command(&[0x10, 0, 0]), None);
+        assert_eq!(handle_recovery_mode_command(&[0x10, 1, 4]), None);
+        assert_eq!(handle_recovery_mode_command(&[0x10, 1]), None);
     }
 
     #[test]

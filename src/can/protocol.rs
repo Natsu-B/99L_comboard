@@ -180,6 +180,7 @@ wire_enum!(RecoveryOpcode {
     Wake = 1,
     StartLogDump = 2,
     StopLogDump = 3,
+    ExitRecovery = 4,
 });
 
 wire_enum!(RecoverySource {
