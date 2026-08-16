@@ -4,8 +4,8 @@ pub mod settings;
 pub mod telemetry;
 
 pub use nmea::{
-    FixQuality, GgaData, GgaParseError, GstData, NmeaParseError, RmcData, UtcTime, parse_gga,
-    parse_gst, parse_rmc_movement,
+    FixQuality, GgaData, GgaParseError, GstData, NmeaParseError, RmcData, UtcDate, UtcDateTime,
+    UtcTime, parse_gga, parse_gst, parse_rmc_datetime, parse_rmc_movement,
 };
 #[cfg(target_arch = "xtensa")]
 pub use settings::{
