@@ -138,7 +138,8 @@ fn to_unix_seconds(
     if year < 1970 {
         return Err(GnssTimeParseError::OutOfRange);
     }
-    let days = days_before_year(year) - days_before_year(1970) + days_before_month(year, month)
+    let days = days_before_year(year) - days_before_year(1970)
+        + days_before_month(year, month)
         + u64::from(day - 1);
     let leap_second_carry = u64::from(second == 60);
     let normal_second = u64::from(second.min(59));
