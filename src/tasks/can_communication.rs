@@ -15,7 +15,7 @@ use crate::{
         health::{CanHealth, classify_can_health},
         protocol::{
             CanRxMessage, CanTxMessage, CommandResult, ControlRollTelemetryV2, RecoveryControl,
-            RecoveryOpcode, RecoverySource, RecoveryStatusCode, emergency_failure_result,
+            RecoveryOpcode, RecoverySource, RecoveryStatusCode, TimeSource, emergency_failure_result,
             is_emergency_result_command, prioritize_untracked_emergency_result,
         },
         tx::{CanTxError, transmit_message_with_timeout},
@@ -32,15 +32,17 @@ use crate::{
         CAN_CACHE, CAN_FALLBACK_HEALTH, CAN_HEALTH, CAN_REC, CAN_RX_ERROR_COUNT,
         CAN_SAFETY_TX_CHANNEL, CAN_TEC, CAN_TX_CHANNEL, CAN_TX_ERROR_COUNT, CAN_TX_SUCCESS_COUNT,
         COMMAND_RESULT_LORA_CHANNEL, COMMAND_TRACKER, CONTROL_ROLL_LORA_SIGNAL,
-        EMERGENCY_RESULT_LORA_CHANNEL, GNSS_CMD_CHANNEL, GROUND_TIME_REQUEST_LORA_CHANNEL,
-        GnssCommand, IS_CAN_ERROR, LOGGING_REQUESTED, LORA_EMERGENCY_RESULT_DROP_COUNT,
-        LORA_GROUND_TIME_REQUEST_DROP_COUNT, LORA_GROUND_TIME_REQUEST_DUPLICATE_COUNT,
-        LORA_TX_QUEUE_DROP_COUNT, MISSION_STATUS_INVALID_AT_MS, RAW_CAN_LOG_CHANNEL,
-        RAW_CAN_LOG_DROPPED_COUNT, RECOVERY_ASSEMBLER, RECOVERY_BEACON_ACTIVE,
-        RECOVERY_ENTER_SENT, RECOVERY_LORA_CHANNEL, RECOVERY_MODE_CHANGE_PENDING,
-        RECOVERY_SESSION, RawCanRecord,
+        EMERGENCY_RESULT_LORA_CHANNEL, GNSS_ABSOLUTE_TIME, GNSS_CMD_CHANNEL,
+        GROUND_TIME_REQUEST_LORA_CHANNEL, CanTxRequest, GnssCommand, IS_CAN_ERROR,
+        LOGGING_REQUESTED, LORA_EMERGENCY_RESULT_DROP_COUNT, LORA_GROUND_TIME_REQUEST_DROP_COUNT,
+        LORA_GROUND_TIME_REQUEST_DUPLICATE_COUNT, LORA_TX_QUEUE_DROP_COUNT,
+        MISSION_STATUS_INVALID_AT_MS, RAW_CAN_LOG_CHANNEL, RAW_CAN_LOG_DROPPED_COUNT,
+        RECOVERY_ASSEMBLER, RECOVERY_BEACON_ACTIVE, RECOVERY_ENTER_SENT, RECOVERY_LORA_CHANNEL,
+        RECOVERY_MODE_CHANGE_PENDING, RECOVERY_SESSION, RawCanRecord,
     },
 };
+
+const GNSS_TIME_FRESHNESS_MS: u64 = 3_000;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum CanRuntimeState {
@@ -393,7 +395,28 @@ async fn apply_received_message(
             }
         }
         CacheUpdate::TimeRequest { request_id } => {
-            queue_ground_time_request(request_id, previous_time_request_id);
+            let gnss_time = *GNSS_ABSOLUTE_TIME.lock().await;
+            let served_by_gnss = gnss_time
+                .filter(|time| time.fresh(received_at_ms, GNSS_TIME_FRESHNESS_MS))
+                .and_then(|time| time.projected(received_at_ms))
+                .is_some_and(|time| {
+                    CAN_SAFETY_TX_CHANNEL
+                        .try_send(CanTxRequest {
+                            message: CanTxMessage::TimeResponse {
+                                request_id,
+                                source: TimeSource::Gnss,
+                                unix_seconds: time.unix_seconds,
+                                milliseconds: time.milliseconds,
+                            },
+                        })
+                        .is_ok()
+                });
+            if served_by_gnss {
+                // 次回Ground fallback時に同一request IDを過去B1のduplicateと誤判定しない。
+                *previous_time_request_id = None;
+            } else {
+                queue_ground_time_request(request_id, previous_time_request_id);
+            }
         }
         CacheUpdate::MissionEvent { event, new_flags } => {
             println!(
