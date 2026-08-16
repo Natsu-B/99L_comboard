@@ -1,4 +1,4 @@
-use core::sync::atomic::Ordering;
+use core::sync::atomic::{AtomicU8, Ordering};
 
 use embassy_futures::select::{Either, Either3, select, select3};
 use embassy_time::{Duration, Instant, Ticker};
@@ -41,6 +41,35 @@ use crate::{
         RECOVERY_MODE_CHANGE_PENDING, RECOVERY_SESSION, RawCanRecord,
     },
 };
+
+const CAN_ID_DEVICE_HEALTH: u16 = 0x10b;
+const DEVICE_STATE_MAX: u8 = 4;
+
+// 0x10BはMission Boardが直接管理するdevice状態を10 Hzで送る。
+// Atomic cacheにすることでCAN owner以外からもawaitなしで最新値を参照できる。
+pub static MISSION_DEVICE_HEALTH_SEQUENCE: AtomicU8 = AtomicU8::new(0);
+pub static MISSION_ICM42688_STATE: AtomicU8 = AtomicU8::new(0);
+pub static MISSION_AS5047D_STATE: AtomicU8 = AtomicU8::new(0);
+pub static MISSION_LPS25HB_STATE: AtomicU8 = AtomicU8::new(0);
+pub static MISSION_SSC_STATE: AtomicU8 = AtomicU8::new(0);
+pub static MISSION_SD_STATE: AtomicU8 = AtomicU8::new(0);
+
+fn decode_device_health(data: &[u8]) -> Option<[u8; 6]> {
+    if data.len() != 6 || data[1..].iter().any(|state| *state > DEVICE_STATE_MAX) {
+        return None;
+    }
+    Some([data[0], data[1], data[2], data[3], data[4], data[5]])
+}
+
+fn cache_device_health(health: [u8; 6]) {
+    MISSION_ICM42688_STATE.store(health[1], Ordering::Relaxed);
+    MISSION_AS5047D_STATE.store(health[2], Ordering::Relaxed);
+    MISSION_LPS25HB_STATE.store(health[3], Ordering::Relaxed);
+    MISSION_SSC_STATE.store(health[4], Ordering::Relaxed);
+    MISSION_SD_STATE.store(health[5], Ordering::Relaxed);
+    // sequenceを最後にpublishし、readerが更新途中のsnapshotを拾いにくくする。
+    MISSION_DEVICE_HEALTH_SEQUENCE.store(health[0], Ordering::Release);
+}
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum CanRuntimeState {
@@ -512,6 +541,17 @@ async fn handle_received_frame(frame: EspTwaiFrame, previous_time_request_id: &m
         return;
     }
 
+    if identifier == CAN_ID_DEVICE_HEALTH {
+        match decode_device_health(frame.data()) {
+            Some(health) => cache_device_health(health),
+            None => {
+                CAN_RX_ERROR_COUNT.fetch_add(1, Ordering::Relaxed);
+                println!("invalid DeviceHealthTelemetry");
+            }
+        }
+        return;
+    }
+
     match CanRxMessage::decode_standard(identifier, frame.data()) {
         Ok(message) => {
             if identifier == 0x102 {
@@ -705,6 +745,13 @@ pub async fn can_communication_task(mut can: twai::Twai<'static, Async>) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn device_health_requires_vault_layout() {
+        assert_eq!(decode_device_health(&[7, 1, 4, 2, 3, 0]), Some([7, 1, 4, 2, 3, 0]));
+        assert_eq!(decode_device_health(&[7, 1, 4, 2, 3]), None);
+        assert_eq!(decode_device_health(&[7, 5, 4, 2, 3, 0]), None);
+    }
 
     #[test]
     fn recovery_mode_command_requires_vault_layout() {
