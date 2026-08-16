@@ -1,0 +1,38 @@
+name: Validate ESP GNSS time integration
+
+on:
+  push:
+    branches:
+      - fix/vault-final-flight-readiness-20260816
+    paths:
+      - .github/workflows/validate-esp-time-sync.yml
+
+permissions:
+  contents: write
+
+jobs:
+  check:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: fix/vault-final-flight-readiness-20260816
+          fetch-depth: 0
+      - uses: dtolnay/rust-toolchain@stable
+      - name: Install ESP Rust toolchain
+        run: |
+          cargo install espup --locked
+          espup install
+      - name: Check ESP firmware
+        shell: bash
+        run: |
+          source "$HOME/export-esp.sh"
+          cargo check
+      - name: Remove temporary workflow
+        if: success()
+        run: |
+          git config user.name github-actions[bot]
+          git config user.email 41898282+github-actions[bot]@users.noreply.github.com
+          git rm .github/workflows/validate-esp-time-sync.yml
+          git commit -m "test(comboard): check ESP GNSS time integration"
+          git push origin HEAD:fix/vault-final-flight-readiness-20260816
