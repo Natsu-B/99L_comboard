@@ -17,9 +17,9 @@ use crate::{
     lora_uplink::UplinkCommand,
     payload::{ApplicationPacket, CommandResultPacket},
     state::{
-        CAN_TX_CHANNEL, COMMAND_RESULT_LORA_CHANNEL, COMMAND_TRACKER, GNSS_CMD_CHANNEL,
-        GnssCommand, LOGGING_REQUESTED, LORA_TX_QUEUE_DROP_COUNT, RECOVERY_ASSEMBLER,
-        RECOVERY_BEACON_ACTIVE, RECOVERY_SESSION, SD_FLUSH_SIGNAL, CanTxRequest,
+        CAN_TX_CHANNEL, COMMAND_RESULT_LORA_CHANNEL, COMMAND_TRACKER, CanTxRequest,
+        GNSS_CMD_CHANNEL, GnssCommand, LOGGING_REQUESTED, LORA_TX_QUEUE_DROP_COUNT,
+        RECOVERY_ASSEMBLER, RECOVERY_BEACON_ACTIVE, RECOVERY_SESSION, SD_FLUSH_SIGNAL,
         UPLINK_COMMAND_CHANNEL,
     },
 };
@@ -27,9 +27,9 @@ use crate::{
 #[path = "lora_task_base.rs"]
 mod base;
 
-pub use base::{lora_rx_task, lora_tx_task};
 #[cfg(feature = "lora-timing-debug")]
 pub use base::lora_timing_report_task;
+pub use base::{lora_rx_task, lora_tx_task};
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 #[repr(u8)]

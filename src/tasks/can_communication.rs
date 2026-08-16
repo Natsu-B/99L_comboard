@@ -38,7 +38,7 @@ use crate::{
         LORA_GROUND_TIME_REQUEST_DUPLICATE_COUNT, LORA_TX_QUEUE_DROP_COUNT,
         MISSION_STATUS_INVALID_AT_MS, RAW_CAN_LOG_CHANNEL, RAW_CAN_LOG_DROPPED_COUNT,
         RECOVERY_ASSEMBLER, RECOVERY_BEACON_ACTIVE, RECOVERY_ENTER_SENT, RECOVERY_LORA_CHANNEL,
-        RECOVERY_MODE_CHANGE_PENDING, RECOVERY_SESSION, RawCanRecord,
+        RECOVERY_SESSION, RawCanRecord,
     },
 };
 
@@ -455,7 +455,6 @@ async fn apply_received_message(
                     && result.reason == crate::can::protocol::CommandReason::None
                 {
                     RECOVERY_BEACON_ACTIVE.store(false, Ordering::Relaxed);
-                    RECOVERY_MODE_CHANGE_PENDING.store(true, Ordering::Relaxed);
                     CONTROL_ROLL_LORA_SIGNAL.signal(());
                 }
                 queue_command_result(CommandResultPacket {
@@ -529,7 +528,6 @@ async fn handle_received_frame(frame: EspTwaiFrame, previous_time_request_id: &m
         match handle_recovery_mode_command(frame.data()) {
             Some(true) => {
                 CAN_CACHE.lock().await.clear_recovery_power_snapshot();
-                RECOVERY_MODE_CHANGE_PENDING.store(true, Ordering::Relaxed);
                 CONTROL_ROLL_LORA_SIGNAL.signal(());
             }
             Some(false) => {}
@@ -748,7 +746,10 @@ mod tests {
 
     #[test]
     fn device_health_requires_vault_layout() {
-        assert_eq!(decode_device_health(&[7, 1, 4, 2, 3, 0]), Some([7, 1, 4, 2, 3, 0]));
+        assert_eq!(
+            decode_device_health(&[7, 1, 4, 2, 3, 0]),
+            Some([7, 1, 4, 2, 3, 0])
+        );
         assert_eq!(decode_device_health(&[7, 1, 4, 2, 3]), None);
         assert_eq!(decode_device_health(&[7, 5, 4, 2, 3, 0]), None);
     }
