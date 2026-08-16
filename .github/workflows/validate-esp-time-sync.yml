@@ -21,8 +21,8 @@ jobs:
       - uses: dtolnay/rust-toolchain@stable
       - name: Install ESP Rust toolchain
         run: |
-          cargo install espup --locked
-          espup install
+          RUSTUP_TOOLCHAIN=stable cargo install espup --locked
+          RUSTUP_TOOLCHAIN=stable espup install
       - name: Check ESP firmware
         shell: bash
         run: |
