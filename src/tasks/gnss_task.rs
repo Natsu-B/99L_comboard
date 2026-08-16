@@ -46,7 +46,7 @@ async fn set_receiver_state(state: GnssReceiverState) {
 }
 
 #[embassy_executor::task]
-pub async fn gnss_manager_task(mut uart: Uart<'static, Async>, mut gnss_en: Output<'static>) {
+pub async fn gnss_manager_task(mut uart: Uart<'static, Async>, _gnss_en: Output<'static>) {
     let mut read_buf = [0u8; 90];
     let mut line_buf = [0u8; 90];
     let mut line_length = 0;
@@ -112,12 +112,10 @@ pub async fn gnss_manager_task(mut uart: Uart<'static, Async>, mut gnss_en: Outp
                     }
                     GNSS_TIME_VALID.store(false, Ordering::Release);
                     set_receiver_state(GnssReceiverState::Starting).await;
-                    gnss_en.set_high();
                     let config_9600 = UartConfig::default().with_baudrate(9_600);
                     if uart.apply_config(&config_9600).is_err() {
                         GNSS_SETTING_ERROR_COUNT.fetch_add(1, Ordering::Relaxed);
                         set_receiver_state(GnssReceiverState::ConfigurationFailed).await;
-                        gnss_en.set_low();
                         continue;
                     }
                     // receiver起動時のNMEAを待機中も読み、UART FIFO overflowを防ぐ。
@@ -146,7 +144,6 @@ pub async fn gnss_manager_task(mut uart: Uart<'static, Async>, mut gnss_en: Outp
                             GNSS_TIME_VALID.store(false, Ordering::Release);
                             println!("GNSS setting failed: {:?}", error);
                             set_receiver_state(GnssReceiverState::ConfigurationFailed).await;
-                            gnss_en.set_low();
                             continue;
                         }
                     }
@@ -158,13 +155,11 @@ pub async fn gnss_manager_task(mut uart: Uart<'static, Async>, mut gnss_en: Outp
                         GNSS_SETTING_ERROR_COUNT.fetch_add(1, Ordering::Relaxed);
                         GNSS_TIME_VALID.store(false, Ordering::Release);
                         set_receiver_state(GnssReceiverState::ConfigurationFailed).await;
-                        gnss_en.set_low();
                         continue;
                     }
                     is_on = true;
                 }
                 GnssCommand::TurnOff => {
-                    gnss_en.set_low();
                     is_on = false;
                     GNSS_TIME_VALID.store(false, Ordering::Release);
                     {

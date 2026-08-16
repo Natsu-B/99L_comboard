@@ -79,7 +79,7 @@ async fn main(spawner0: Spawner) -> ! {
     let mut m0 = Output::new(peripherals.GPIO9, Level::Low, OutputConfig::default());
     let mut m1 = Output::new(peripherals.GPIO10, Level::Low, OutputConfig::default());
     let gnss_tx = Output::new(peripherals.GPIO14, Level::Low, OutputConfig::default());
-    let gnss_en = Output::new(peripherals.GPIO13, Level::Low, OutputConfig::default());
+    let gnss_en = Output::new(peripherals.GPIO13, Level::High, OutputConfig::default());
     let aux_pin = Input::new(peripherals.GPIO8, InputConfig::default());
     let lora_rx = Input::new(peripherals.GPIO12, InputConfig::default());
     let gnss_rx = Input::new(peripherals.GPIO21, InputConfig::default());
